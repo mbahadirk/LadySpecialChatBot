@@ -25,6 +25,7 @@ class ImageService:
 
     def __init__(self):
         self._clip_model = None  # Lazy load (RAM tasarrufu)
+        self._yolo_model = None  # Lazy load YOLO for cropping
         self._qdrant = None
         self._product_db: list[dict] = []
         self._product_db_loaded = False
@@ -40,10 +41,34 @@ class ImageService:
         """CLIP modelini lazy-load eder."""
         if self._clip_model is None:
             print("[ImageService] CLIP modeli yukleniyor (ilk seferlik)...")
-            from sentence_transformers import SentenceTransformer
-            self._clip_model = SentenceTransformer('sentence-transformers/clip-ViT-L-14')
+            from fashion_clip_wrapper import FashionCLIPWrapper
+            self._clip_model = FashionCLIPWrapper()
             print("[ImageService] CLIP modeli hazir.")
         return self._clip_model
+
+    def _get_yolo_model(self):
+        """YOLOv8 modelini lazy-load eder."""
+        if self._yolo_model is None:
+            print("[ImageService] YOLO modeli yukleniyor...")
+            import torch
+            import warnings
+            
+            # PyTorch 2.6+ fix for ultralytics weight loading
+            original_load = torch.load
+            def safe_load(*args, **kwargs):
+                kwargs['weights_only'] = False
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    return original_load(*args, **kwargs)
+            torch.load = safe_load
+            
+            from ultralytics import YOLO
+            self._yolo_model = YOLO('yolov8n.pt')  # Nano model, hizli
+            
+            # Restore original load
+            torch.load = original_load
+            print("[ImageService] YOLO modeli hazir.")
+        return self._yolo_model
 
     def _get_qdrant(self):
         """Qdrant istemcisini lazy-load eder."""
@@ -103,10 +128,37 @@ class ImageService:
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
+            # ─── YOLO KIRPMA (Crop) İŞLEMİ ───
+            print("[ImageService] Gorsel YOLO ile analiz ediliyor...")
+            yolo = self._get_yolo_model()
+            # classes=[0] -> Sadece insanları bul (veya kıyafet için eğitilmiş modeliniz varsa o class_id'leri ekleyin)
+            # YOLO ürün tespiti için giyim (kıyafet vb.) class'ları COCO'da spesifik olmadığı için, 
+            # kişi bounding box'unu kesmek modada genellikle işe yarar.
+            results = yolo(image, classes=[0], verbose=False)
+            
+            best_crop = None
+            if len(results) > 0 and len(results[0].boxes) > 0:
+                # En yüksek güven (confidence) skoruna sahip kişiyi seç
+                boxes = results[0].boxes
+                best_box = max(boxes, key=lambda b: b.conf[0].item())
+                
+                # Koordinatları al
+                x1, y1, x2, y2 = best_box.xyxy[0].tolist()
+                print(f"[ImageService] Obje tespit edildi. Kirpiliyor: ({int(x1)}, {int(y1)}) - ({int(x2)}, {int(y2)})")
+                
+                # Orijinal görseli kırp
+                cropped_image = image.crop((x1, y1, x2, y2))
+                best_crop = cropped_image
+            else:
+                print("[ImageService] YOLO herhangi bir obje/insan bulamadi. Orijinal gorsel kullanilacak.")
+            
+            # Kırpılmış görsel varsa onu kullan, yoksa orijinali
+            target_image = best_crop if best_crop is not None else image
+
             # CLIP ile vektöre çevir
-            print("[ImageService] Gorsel CLIP ile vektore cevriliyor...")
+            print("[ImageService] Gorsel FashionCLIP ile vektore cevriliyor...")
             model = self._get_clip_model()
-            embedding = model.encode(image)
+            embedding = model.encode(target_image)
 
             # Qdrant'ta ara
             print(f"[ImageService] Qdrant'ta aranıyor (koleksiyon: {COLLECTION_NAME})...")
@@ -122,8 +174,17 @@ class ImageService:
             # Filtrele ve tekilleştir
             unique_products = []
             seen_names = set()
+            
+            # Eşik Değeri (Threshold)
+            # FashionCLIP için deneme yanılma ile optimize edilebilir. (0.25 - 0.30 başlangıç için iyi olabilir)
+            SCORE_THRESHOLD = 0.25 
 
             for hit in search_result:
+                # Eğer skor eşiğin altındaysa, bu sonucu ve sonrakileri atla
+                if hit.score < SCORE_THRESHOLD:
+                    print(f"[ImageService] Urun '{hit.payload.get('name', 'Bilinmeyen')}' elendi. Skor: {hit.score:.4f} < {SCORE_THRESHOLD}")
+                    continue
+
                 payload = hit.payload
                 name = payload.get("name", "")
 

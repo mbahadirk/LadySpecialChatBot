@@ -180,9 +180,8 @@ Eğer senden stoğu bitmiş bir ürünle ilgili bilgi isterse stokta olmadığı
 
     def get_clip_model(self):
         if not self.clip_model:
-            from sentence_transformers import SentenceTransformer
-            # Must match the model used in indexer.py (768 dim)
-            self.clip_model = SentenceTransformer('sentence-transformers/clip-ViT-L-14')
+            from fashion_clip_wrapper import FashionCLIPWrapper
+            self.clip_model = FashionCLIPWrapper()
         return self.clip_model
 
     def analyze_message(self, message_data):

@@ -26,9 +26,9 @@ lock = threading.Lock()
 
 
 def load_model():
-    print("Loading CLIP model (ViT-L-14)...")
-    # Cihazın durumuna göre (GPU/CPU) otomatik ayarlanır
-    return SentenceTransformer('sentence-transformers/clip-ViT-L-14')
+    print("Loading CLIP model (fashion-clip)...")
+    from fashion_clip_wrapper import FashionCLIPWrapper
+    return FashionCLIPWrapper()
 
 
 def clean_html(raw_html):
@@ -41,17 +41,17 @@ def clean_html(raw_html):
 def setup_qdrant(client):
     try:
         info = client.get_collection(COLLECTION_NAME)
-        # Eğer boyut uyuşmazlığı varsa (Eski 512, Yeni 768) koleksiyonu silip yeniden kur
-        if info.config.params.vectors.size != 768:
-            print(f"⚠️ Boyut uyuşmazlığı tespit edildi (Beklenen: 768). Koleksiyon yeniden oluşturuluyor...")
+        # Eğer boyut uyuşmazlığı varsa (Eski 768, Yeni 512) koleksiyonu silip yeniden kur
+        if info.config.params.vectors.size != 512:
+            print(f"⚠️ Boyut uyuşmazlığı tespit edildi (Beklenen: 512). Koleksiyon yeniden oluşturuluyor...")
             client.delete_collection(COLLECTION_NAME)
             raise Exception("Recreate needed")
         print(f"✅ Koleksiyon '{COLLECTION_NAME}' mevcut ve geçerli.")
     except Exception:
-        print(f"🔨 Koleksiyon '{COLLECTION_NAME}' 768 boyutunda oluşturuluyor...")
+        print(f"🔨 Koleksiyon '{COLLECTION_NAME}' 512 boyutunda oluşturuluyor...")
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
+            vectors_config=models.VectorParams(size=512, distance=models.Distance.COSINE),
         )
 
 
