@@ -8,7 +8,8 @@ Kurallar:
 - Fiyat bilgisini net olarak paylaş.
 - Eğer birden fazla ürün bulunduysa en alakalı olanları özetle.
 - Stokta olan ürünlerin farklı renk/beden seçeneklerini belirt.
-- Ürünün web sitesindeki linkini paylaş (varsa).
+- Ürünün web sitesindeki linkini paylaş (varsa ve sadece stoktaysa).
+- ASLA stokta olmayan (tükenmiş) bir ürün için link veya URL paylaşma. Sadece adını söyle.
 - Satın alma için yönlendirme yap.
 
 Format Örneği:

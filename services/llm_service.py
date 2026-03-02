@@ -302,7 +302,7 @@ class LLMService:
             else:
                  stock_status = "TUKENMIS"
             line = f"{p['name']} -- {p.get('price', 0)} TL -- {stock_status}"
-            if p.get("in_stock") and p.get("url"):
+            if stock_count > 0 and p.get("url"):
                 line += f" -- URL: {p['url']}"
             lines.append(line)
 
@@ -327,10 +327,11 @@ class LLMService:
                 variant_texts = [v.get("option1", "") for v in p["in_stock_variants"][:5]]
                 variants_info = f" | Seçenekler: {', '.join(variant_texts)}"
 
+            url_line = f"\n   URL: {p.get('url', 'Yok')}" if stock_count > 0 else ""
+
             lines.append(
                 f"{p['name']} — {p.get('price', 0)} {p.get('currency', 'TL')} — "
-                f"{stock_status}{variants_info}\n"
-                f"   URL: {p.get('url', 'Yok')}"
+                f"{stock_status}{variants_info}{url_line}"
             )
 
         return "\n".join(lines)
