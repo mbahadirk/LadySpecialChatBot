@@ -503,9 +503,9 @@ class ProductSync:
                         # CLIP embedding (Asenkron loop'u bloklamamak için thread kullan)
                         embedding = await asyncio.to_thread(clip_model.encode, img)
 
-                        # Benzersiz Qdrant point ID
+                        # Benzersiz Qdrant point ID (Deterministic - always the same)
                         point_id_str = f"{row['product_id']}_{row['image_url']}"
-                        point_id = abs(hash(point_id_str)) % (2**63 - 1)
+                        point_id = int(hashlib.md5(point_id_str.encode("utf-8")).hexdigest()[:15], 16)
 
                         slug = row["slug"] or ""
                         url = f"{WEBSITE_BASE_URL}/{slug}" if slug else WEBSITE_BASE_URL
