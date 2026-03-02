@@ -39,41 +39,55 @@ class Orchestrator:
         user_image.save(buffered, format="JPEG")
         base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
-        candidate_content = []
-        for i, cand in enumerate(candidates):
-            info = cand.payload
-            cand_text = f"Candidate {i+1} (ID: {info.get('id', 'N/A')}, Name: {info['name']}, Price: {info['price']})"
-            candidate_content.append({
+        print(f"DEBUG: Starting verify_match_with_gpt with {len(candidates)} candidates.")
+        
+        # Prepare candidate data for parallel download
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        
+        start_download = time.time()
+        
+        def _download_and_format(index, cand_payload):
+             # Helper to process one candidate
+             info = cand_payload
+             cand_text = f"Candidate {index+1} (ID: {info.get('id', 'N/A')}, Name: {info['name']}, Price: {info['price']})"
+             
+             result_parts = [{
                 "type": "text",
                 "text": cand_text
-            })
-            if info.get('image_url'):
-                 # Download image and convert to base64 to avoid OpenAI timeouts
+             }]
+             
+             if info.get('image_url'):
                  img_data = None
                  try:
                      img_url = info['image_url']
-                     # Use requests to get content
-                     print(f"Downloading candidate image for GPT: {img_url}")
-                     resp = requests.get(img_url, timeout=10) # Increased timeout
+                     # print(f"Downloading candidate image: {img_url}")
+                     resp = requests.get(img_url, timeout=4) # Short timeout
                      if resp.status_code == 200:
                          cand_b64 = base64.b64encode(resp.content).decode('utf-8')
                          img_data = f"data:image/jpeg;base64,{cand_b64}"
-                     else:
-                         print(f"Failed to download image. Status: {resp.status_code}")
-                 except Exception as e:
-                     print(f"Failed to convert candidate image to base64: {e}")
+                 except Exception:
+                     pass # Silently fail to keep logs clean
 
                  if img_data:
-                     candidate_content.append({
+                     result_parts.append({
                         "type": "image_url",
                         "image_url": {"url": img_data}
                     })
                  else:
-                     # If download fails, append text warning to GPT so it knows image is missing
-                     candidate_content.append({
+                     result_parts.append({
                         "type": "text",
-                        "text": "[IMAGE AVAILABLE BUT DOWNLOAD FAILED]"
+                        "text": "[IMAGE DOWNLOAD FAILED]"
                     })
+             return result_parts
+
+        candidate_content = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(_download_and_format, i, c.payload) for i, c in enumerate(candidates)]
+            for future in futures:
+                candidate_content.extend(future.result())
+        
+        print(f"DEBUG: Downloads finished in {time.time() - start_download:.2f}s")
 
         prompt_messages = [
             {
@@ -104,11 +118,13 @@ class Orchestrator:
         
         try:
             print("Identifying best match with GPT-4o...")
+            start_gpt = time.time()
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=prompt_messages,
                 max_tokens=150
             )
+            print(f"DEBUG: GPT-4o call finished in {time.time() - start_gpt:.2f}s")
             content = response.choices[0].message.content.strip()
             print(f"GPT-4o Response: {content}")
             
@@ -244,6 +260,48 @@ class Orchestrator:
         self.history.append({"role": role, "content": content})
 
 
+    def detect_clothing_category(self, image):
+        # Convert PIL Image to base64
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+            
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Analyze the clothing item in the image and classify it into ONE of these categories: 'Elbise', 'Pantolon', 'Etek', 'Kazak' (includes Blouse/Shirt/Top/Hırka), 'Ceket' (includes Vest/Coat), 'Takım' (Set). Return ONLY the category name."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                max_tokens=10
+            )
+            category = response.choices[0].message.content.strip().lower()
+            print(f"DEBUG: Detected Category: {category}")
+            
+            # Map valid outputs
+            if "elbise" in category: return "elbise"
+            if "pantolon" in category: return "pantolon"
+            if "etek" in category: return "etek"
+            if "kazak" in category or "bluz" in category or "gömlek" in category or "hırka" in category: return "kazak"
+            if "ceket" in category or "mont" in category: return "ceket"
+            if "takım" in category: return "takım"
+            
+            return None
+        except Exception as e:
+            print(f"Category Detection Error: {e}")
+            return None
+
     def handle_image(self, image_source):
         print(f"Handling Image...")
         
@@ -265,6 +323,10 @@ class Orchestrator:
 
             if not image:
                 return "Could not process image."
+            
+            # Ensure RGB (Fix for YOLO 4-channel error and JPEG saving)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
 
             if not image:
                 return "Could not process image."
@@ -284,6 +346,12 @@ class Orchestrator:
                     trace.append(f"- ⚠️ YOLO: Kişi tespit edilemedi, tam resim kullanılıyor.")
             except Exception as e:
                 trace.append(f"- ❌ YOLO Hatası: {e}")
+            
+            # 1.8. Smart Category Detection (Hybrid Search)
+            # trace.append(f"- 🧠 GPT-4o: Görsel kategorisi analiz ediliyor...")
+            # detected_category = self.detect_clothing_category(image)
+            detected_category = None # DISABLED to save cost
+            # trace.append(f"- 🏷️ Kategori: {detected_category}")
 
             # 2. Vectorize
             model = self.get_clip_model()
@@ -291,38 +359,42 @@ class Orchestrator:
             trace.append(f"- 🧠 CLIP: Görsel vektöre çevrildi (768 boyut).")
             
             # 3. Search Qdrant
+            # Retrieve MORE results then filter
             print(f"Querying Qdrant collection: {COLLECTION_NAME}")
             search_result = qdrant.query_points(
                 collection_name=COLLECTION_NAME,
                 query=embedding.tolist(),
-                limit=15
+                limit=50 # Fetch more for filtering
             ).points
+            
+            trace.append(f"- 🔎 Qdrant: {len(search_result)} ham sonuç bulundu.")
+            
+            # Filtering & Deduplication Logic
+            unique_products = []
+            seen_names = set()
             
             for hit in search_result:
                 payload = hit.payload
                 score = hit.score
                 p_name = payload.get('name')
-                p_price = payload.get('price')
+                p_category = payload.get('category', '').lower()
+                
+                # Category Filter (DISABLED)
+                if detected_category:
+                     # ... (logic skipped since None)
+                     pass
+            
                 p_stock = int(payload.get('stock', 0)) # Fallback to 0 if missing
                 
-                # 1. Stock Check
-                # İkas CSV'den gelen veriye göre stok kontrolü.
-                # Eğer stok verisi yoksa veya 0 ise atla/uyar.
-                # Ancak görsel aramada bazen stoksuz da olsa benzerini görmek isteyebilir.
-                # Kullanıcı "aktif olmayan ürünleri tahmin ettiğinde..." dediği için stoksuzları eleyelim veya alta atalım.
-                # Şimdilik katı filtre: Stok > 0
                 if p_stock <= 0:
                     continue
 
-                # 2. Deduplication (Variety)
-                # Aynı isimdeki ürünü (farklı renk varyantı olsa bile) birden fazla gösterme.
                 if p_name in seen_names:
                     continue
                 
                 seen_names.add(p_name)
                 unique_products.append(hit)
                 
-                # Add score to trace
                 trace.append(f"  * Aday: {p_name} (Skor: {score:.4f})")
                 
                 if len(unique_products) >= 5:
@@ -331,47 +403,37 @@ class Orchestrator:
             trace.append(f"- 🧹 Filtreleme: Stok ve kopyalar temizlendi. Geriye {len(unique_products)} aday kaldı.")
 
             if not unique_products:
-                print("Returning 'No similar products found' after filtering.")
-                # Fallback: If strict filtering killed all results, maybe retrieve top 1 regardless of stock?
-                # For now, respect user wish "aktif olanı getirmeli".
                 return "Üzgünüm, buna benzer stokta olan bir ürün bulamadım.\n\n" + "\n".join(trace)
             
-            # High Confidence Check (GPT-4o Verification)
-            # Only ask GPT if top equivalent score is decent (e.g., > 0.70) to save cost? 
-            # Or just always ask for top 5. Let's do top 5.
+            # High Confidence Check (GPT-4o Verification) - DISABLED
+            # candidates_for_gpt = unique_products[:5]
+            # best_match_id, reasoning = self.verify_match_with_gpt(image, candidates_for_gpt)
             
-            # High Confidence Check (GPT-4o Verification)
-            candidates_for_gpt = unique_products[:5]
-            trace.append(f"- 🤖 GPT-4o: İlk 5 aday görsel doğrulama için gönderiliyor...")
-            
-            best_match_id, reasoning = self.verify_match_with_gpt(image, candidates_for_gpt)
-            
-            trace.append(f"- 🧠 GPT Mantığı: {reasoning}")
-            trace.append(f"- 🤖 GPT Kararı: {best_match_id}")
+            # Fallback to Top 1 Vector Match
+            best_match_id = str(unique_products[0].payload['id'])
+            reasoning = "En yüksek vektör benzerlik skoru."
             
             matched_product = None
             response_text = ""
-            if best_match_id and best_match_id != "None":
+            if best_match_id:
                 # Find the product with this ID
-                for prod in candidates_for_gpt:
-                    if str(prod.payload.get('id')) == str(best_match_id):
-                        matched_product = prod.payload
-                        break
+                matched_product = unique_products[0].payload
             
             if matched_product:
-                trace.append(f"- ✅ Eşleşme Onaylandı: {matched_product['name']}")
-                response_text = f"🎯 **Bunu buldum!** (GPT Onaylı)\n\nBu ürün:\n**{matched_product['name']}** - {matched_product['price']} TL\n"
+                trace.append(f"- ✅ En İyi Eşleşme (Vektör): {matched_product['name']}")
+                response_text = f"Bunu buldum:\n**{matched_product['name']}** - {matched_product['price']} TL\n"
                 if matched_product.get('image_url'):
-                    response_text += f"![Birebir Eşleşme]({matched_product['image_url']})\n"
+                    response_text += f"![Ürün]({matched_product['image_url']})\n"
                 
                 # Show others as alternatives
-                rest = [p for p in unique_products if p.payload['name'] != matched_product['name']]
+                rest = unique_products[1:]
                 if rest:
                      response_text += "\nDiğer benzer seçenekler:\n"
                      for hit in rest[:3]:
                          response_text += f"- {hit.payload['name']} ({hit.payload['price']} TL)\n"
             else:
-                trace.append(f"- ℹ️ Güçlü bir eşleşme bulunamadı, genel liste dönülüyor.")
+                trace.append(f"- ℹ️ Eşleşme bulunamadı.")
+
                 response_text = "Tam olarak aynısını bulamasam da, benzer ürünler şunlar:\n"
                 for hit in unique_products[:5]:
                     payload = hit.payload

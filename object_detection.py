@@ -3,7 +3,7 @@ from PIL import Image
 import numpy as np
 
 class ObjectDetector:
-    def __init__(self, model_name="yolov8n.pt"):
+    def __init__(self, model_name="yolov8l.pt"):
         print(f"Loading YOLO model: {model_name}...")
         self.model = YOLO(model_name)
         # COCO class 0 is 'person'

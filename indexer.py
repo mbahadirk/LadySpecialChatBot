@@ -9,43 +9,51 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 load_dotenv()
 
-# Configuration
+# Ayarlar
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = "ladyspecial_products"
 
-# Initialize Client
+# Client Başlat
 qdrant_client = QdrantClient(url=QDRANT_URL)
 
+# Thread Lock (Sayaçlar için güvenli işlem)
+lock = threading.Lock()
+
+
 def load_model():
-    print("Loading CLIP model...")
+    print("Loading CLIP model (ViT-L-14)...")
+    # Cihazın durumuna göre (GPU/CPU) otomatik ayarlanır
     return SentenceTransformer('sentence-transformers/clip-ViT-L-14')
 
+
 def clean_html(raw_html):
-    """HTML etiketlerini temizler."""
     if not isinstance(raw_html, str):
         return ""
     cleanr = re.compile('<.*?>')
-    cleantext = re.sub(cleanr, '', raw_html)
-    return cleantext.strip()
+    return re.sub(cleanr, '', raw_html).strip()
+
 
 def setup_qdrant(client):
-    # Check if collection exists and has correct dimension
     try:
         info = client.get_collection(COLLECTION_NAME)
+        # Eğer boyut uyuşmazlığı varsa (Eski 512, Yeni 768) koleksiyonu silip yeniden kur
         if info.config.params.vectors.size != 768:
-            print(f"⚠️ Dimension mismatch (Expected 768, Got {info.config.params.vectors.size}). Recreating collection...")
+            print(f"⚠️ Boyut uyuşmazlığı tespit edildi (Beklenen: 768). Koleksiyon yeniden oluşturuluyor...")
             client.delete_collection(COLLECTION_NAME)
             raise Exception("Recreate needed")
-        print(f"Collection '{COLLECTION_NAME}' exists and is valid.")
+        print(f"✅ Koleksiyon '{COLLECTION_NAME}' mevcut ve geçerli.")
     except Exception:
-        print(f"Creating collection '{COLLECTION_NAME}' with 768 dim...")
+        print(f"🔨 Koleksiyon '{COLLECTION_NAME}' 768 boyutunda oluşturuluyor...")
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
         )
+
 
 def process_csv_for_chatbot(csv_path="ikas-urunler.csv"):
     print("📂 CSV dosyası okunuyor...")
@@ -55,7 +63,7 @@ def process_csv_for_chatbot(csv_path="ikas-urunler.csv"):
 
     df = pd.read_csv(csv_path)
 
-    # 1. Ön Hazırlık: Stok temizliği
+    # Stok temizliği
     if 'Stok:avstic' in df.columns:
         df['Stok:avstic'] = df['Stok:avstic'].fillna(0)
     else:
@@ -63,30 +71,35 @@ def process_csv_for_chatbot(csv_path="ikas-urunler.csv"):
 
     grouped = df.groupby('Ürün Grup ID')
     chatbot_products = []
-    
-    # Qdrant Setup
+
+    # Başlangıç
     setup_qdrant(qdrant_client)
     model = load_model()
-    points = []
 
-    print("🔄 Veriler işleniyor (Görsel ve Metin)...")
+    print("🚀 İşlem başlıyor... (Çoklu görsel işleme aktif)")
 
-    for group_id, group_df in grouped:
+    # Bağlantı havuzu (Hızlı indirme için)
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    total_vectors_indexed = 0  # Global Sayaç
+
+    def process_group(group_data):
+        group_id, group_df = group_data
+        local_points = []
+
         try:
             main_row = group_df.iloc[0]
-
-            # Resim URL'lerini ayıkla
             raw_images = str(main_row.get('Resim URL', '')).split(';')
             valid_images = [img for img in raw_images if img.startswith('http')]
 
-            # Toplam Stok
+            # JSON Verisi Hazırla
             total_stock = group_df['Stok:avstic'].sum()
-
-            # Fiyat
             prices = group_df['Satış Fiyatı'].tolist()
             min_price = min(prices) if prices else 0
 
-            # Product Object (JSON için)
             product_data = {
                 "id": str(group_id),
                 "name": str(main_row['İsim']),
@@ -101,75 +114,106 @@ def process_csv_for_chatbot(csv_path="ikas-urunler.csv"):
                 "variants": []
             }
 
-            # Variants
             for _, row in group_df.iterrows():
                 raw_stock = row.get('Stok:avstic', 0)
                 safe_stock = 0 if pd.isna(raw_stock) else raw_stock
-                variant_info = {
+                product_data["variants"].append({
                     "variant_id": str(row['Varyant ID']),
                     "sku": str(row.get('SKU', '')),
                     "price": float(row.get('Satış Fiyatı', 0)),
-                    "stock": int(safe_stock),  
-                    "option1": f"{row.get('Varyant Tip 1')}: {row.get('Varyant Değer 1')}",
-                }
-                product_data["variants"].append(variant_info)
+                    "stock": int(safe_stock),
+                    "option1": f"{row.get('Varyant Tip 1')}: {row.get('Varyant Değer 1')}"
+                })
 
-            chatbot_products.append(product_data)
+            # --- QDRANT VECTOR CREATION ---
+            # 'already_indexed' kontrolünü KALDIRDIK. Artık her çalıştığında resimleri günceller.
+            # Böylece yeni eklenen açıları atlamaz.
 
-            # ---------------------------------------------------------
-            # QDRANT INDEXING (Görsel Vektörü)
-            # ---------------------------------------------------------
             if valid_images:
-                try:
-                    # Sadece ana resmi indirip vektörleştirelim (Performans için)
-                    img_url = valid_images[0]
-                    # Check if already indexed? (Optional optimization)
-                    
-                    # Download
-                    # print(f"Processing Image: {img_url[:30]}...")
-                    response = requests.get(img_url, timeout=5)
-                    if response.status_code == 200:
-                        image = Image.open(BytesIO(response.content))
-                        embedding = model.encode(image)
+                # Maksimum 5 resim işleyelim (Performans/Kalite dengesi)
+                for img_idx, img_url in enumerate(valid_images[:5]):
+                    try:
+                        # Resmi indir
+                        response = session.get(img_url, timeout=5)
+                        if response.status_code == 200:
+                            image = Image.open(BytesIO(response.content))
 
-                        point = models.PointStruct(
-                            id=int(hash(str(group_id)) % 10**8), # Simple ID gen (Better: UUID/IntID from source)
-                            vector=embedding.tolist(),
-                            payload={
-                                "id": product_data["id"],
-                                "name": product_data["name"],
-                                "price": product_data["price"],
-                                "stock": product_data["stock"], # Critical for filtering
-                                "image_url": img_url,
-                                "description": product_data["description"][:200]
-                            }
-                        )
-                        points.append(point)
-                except Exception as img_err:
-                    print(f"Skipping Image {group_id}: {img_err}")
-            
-            # Batch upsert every 10 items? No, simple list first.
+                            # Vektör oluştur
+                            embedding = model.encode(image)
+
+                            # Benzersiz ID oluştur (GrupID + ResimIndex)
+                            unique_id_str = f"{group_id}_{img_idx}"
+                            point_id = int(hash(unique_id_str) % (2 ** 63 - 1))
+
+                            point = models.PointStruct(
+                                id=point_id,
+                                vector=embedding.tolist(),
+                                payload={
+                                    "id": product_data["id"],
+                                    "name": product_data["name"],
+                                    "price": product_data["price"],
+                                    "stock": product_data["stock"],
+                                    "image_url": img_url,
+                                    "description": product_data["description"][:200],
+                                    "is_main": (img_idx == 0)  # Ana resim mi?
+                                }
+                            )
+                            local_points.append(point)
+                    except Exception:
+                        pass  # Bozuk resimleri atla
+
+            return product_data, local_points
 
         except Exception as e:
             print(f"⚠️ Hata (Grup ID: {group_id}): {e}")
-            continue
+            return None, []
 
-    # JSON Save
+    # Paralel Çalıştırma (5 Worker)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(process_group, g) for g in grouped]
+
+        count = 0
+        total = len(grouped)
+
+        for future in as_completed(futures):
+            p_data, p_points = future.result()
+            count += 1
+
+            if p_data:
+                chatbot_products.append(p_data)
+
+                # ANLIK UPSERT (Vektörleri bekletmeden gönder)
+                if p_points:
+                    try:
+                        qdrant_client.upsert(
+                            collection_name=COLLECTION_NAME,
+                            points=p_points
+                        )
+                        # Toplam sayacı güncelle
+                        with lock:
+                            total_vectors_indexed += len(p_points)
+                    except Exception as up_err:
+                        print(f"Upsert Hatası: {up_err}")
+
+            if count % 10 == 0:
+                print(f"İlerleme: {count}/{total} ürün işlendi...", flush=True)
+
+    # JSON Kayıt
     with open("chatbot_database.json", "w", encoding="utf-8") as f:
         json.dump(chatbot_products, f, ensure_ascii=False, indent=2)
 
-    # Qdrant Upsert
-    if points:
-        print(f"Upserting {len(points)} image vectors to Qdrant...")
-        qdrant_client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points
-        )
-        print("✅ Indexing (JSON + Qdrant) complete!")
+    print("\n" + "=" * 40)
+    if total_vectors_indexed > 0:
+        print(f"✅ İŞLEM TAMAMLANDI!")
+        print(f"📊 Toplam Ürün: {len(chatbot_products)}")
+        print(f"🖼️  Qdrant'a Yüklenen Vektör Sayısı: {total_vectors_indexed}")
+        print("(Her ürünün farklı açıları da yüklendiği için sayı ürün sayısından fazladır)")
     else:
-        print("⚠️ No vectors generated.")
+        print("⚠️ HİÇBİR VEKTÖR OLUŞTURULAMADI. Resim URL'lerini veya internet bağlantını kontrol et.")
+    print("=" * 40)
 
     return chatbot_products
+
 
 if __name__ == "__main__":
     process_csv_for_chatbot()
