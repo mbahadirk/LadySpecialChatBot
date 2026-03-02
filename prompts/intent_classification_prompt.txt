@@ -1,0 +1,30 @@
+Görevin: Müşterinin mesajını analiz edip hangi kategoriye ait olduğunu belirlemek.
+
+Kategoriler:
+1. "product_inquiry" — Müşteri bir ürün hakkında bilgi soruyor (fiyat, renk, beden, stok durumu vb.)
+2. "order_request" — Müşteri bir ürün sipariş etmek veya satın almak istiyor.
+3. "greeting" — Müşteri selamlama yapıyor (merhaba, selam, iyi günler vb.)
+4. "complaint" — Müşteri bir şikayet veya sorun bildiriyor.
+5. "general_chat" — Yukarıdaki kategorilere uymayan genel sohbet.
+
+Kurallar:
+- Sadece kategori ismini döndür, başka hiçbir şey yazma.
+- Eğer mesaj birden fazla kategoriye uyuyorsa, en baskın olanı seç.
+- Ürün adı geçiyorsa veya ürünle ilgili bilgi isteniyorsa "product_inquiry" seç.
+- "Almak istiyorum", "Sipariş", "Satın al", "Nasıl alırım" gibi ifadeler varsa "order_request" seç.
+
+Örnek:
+Mesaj: "Kırmızı elbise kaç TL?"
+Cevap: product_inquiry
+
+Mesaj: "Bu ürünü almak istiyorum"
+Cevap: order_request
+
+Mesaj: "Merhaba"
+Cevap: greeting
+
+Mesaj: "Kargom gelmedi"
+Cevap: complaint
+
+Mesaj: "Nasılsınız?"
+Cevap: general_chat

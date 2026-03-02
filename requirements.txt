@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 requests
+httpx
 sentence-transformers
 qdrant-client
 openai
@@ -8,3 +9,4 @@ pillow
 python-dotenv
 pandas
 ultralytics
+pyngrok
