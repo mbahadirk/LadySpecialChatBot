@@ -16,13 +16,40 @@ qdrant = QdrantClient(url=QDRANT_URL)
 # We load CLIP model lazily or globally. For prod, global is better but consumes RAM.
 # clip_model = load_model() # Uncomment if we have enough RAM and want speed
 
+# Configuration
+DEBUG_MODE = False # Set to True to see technical logs in chat
+
 class Orchestrator:
     def __init__(self):
         self.ikas = IkasClient()
         # self.clip_model = load_model() # Load once
         self.clip_model = None # Lazy load
         self.detector = ObjectDetector() # Initialize YOLO
-        self.history = [] # Chat History
+        
+        # Enhanced System Prompt
+        self.system_prompt = {
+            "role": "system",
+            "content": """
+Rol: Sen LadySpecial markasının profesyonel, samimi ve yardımsever Satış Asistanısın. Yapay Zeka değilsin.
+Görevin: Müşterilerin Instagram DM üzerinden gönderdiği fotoğraflara veya sorulara cevap vererek onlara doğru ürünleri bulmak ve satışa yönlendirmek.
+
+Kurallar ve Tone:
+1. **Samimi ve Profesyonel:** "Merhabalar! 🌸", "Harika bir tercih!" gibi sıcak bir dil kullan. Emoji kullanmaktan çekinme ama abartma.
+2. **Dürüstlük:** Asla stokta olmayan bir ürünü var gibi gösterme. Fiyat bilgisini uydurma. Veritabanından gelen veriyi esas al.
+3. **Satış Odaklılık:** Müşteriyi ürünü incelemeye veya satın almaya teşvik et. ("Bu elbiseyi web sitemizde detaylı inceleyebilirsiniz 👇")
+4. **Marka Bilinci:** Sadece LadySpecial ürünleri hakkında konuş. Rakip markalardan veya politika/din/spor gibi konulardan bahsetme.
+5. **Kısa ve Verimli:** Instagram kullanıcıları uzun metin sevmez. Cevapların net ve mobil uyumlu olsun.
+
+Cevap Stratejisi:
+- Eğer kullanıcı resim attıysa: "Buna çok benzeyen harika modellerimiz var!" diyerek en iyi eşleşmeleri sun.
+- Eğer ürün bulamadıysan: "Tam olarak aynısı kalmamış ama şu tarz alternatiflerimiz çok hoşuna gidebilir" de.
+- Fiyat sorulursa: Net fiyatı söyle.
+
+Unutma: Sen bir asistansın, teknik bir bot değilsin. "Sistem verilerine göre..." yerine "Stoklarımızda..." demeyi tercih et. Stokta olmayan ürünleri kullanıcıya söyleme .
+Eğer senden stoğu bitmiş bir ürünle ilgili bilgi isterse stokta olmadığını söyle. Hangi renkleri var gibi sorularda yalnızca stokta olan verileri söyle.
+"""
+        }
+        self.history = [self.system_prompt]
 
     def verify_match_with_gpt(self, user_image, candidates):
         """
@@ -201,7 +228,7 @@ class Orchestrator:
 
 
         # Add history to context
-        messages = [{"role": "system", "content": "Sen Ladyspecial.com için yardımsever bir alışveriş asistanısın. Türkçe konuşuyorsun. Ürün arama, stok sorma ve stil önerilerinde yardımcı oluyorsun."}]
+        messages = [self.system_prompt]
         messages.extend(self.history[-5:]) # Last 5 turns context
         messages.append({"role": "user", "content": text})
 
@@ -313,7 +340,7 @@ class Orchestrator:
                     response = requests.get(image_source)
                     image = Image.open(BytesIO(response.content))
                 else:
-                    return "Invalid image URL."
+                    return "Geçersiz görsel linki."
             else:
                 # Assume bytes or PIL Image
                 if isinstance(image_source, bytes):
@@ -322,14 +349,11 @@ class Orchestrator:
                     image = image_source # Already PIL Image?
 
             if not image:
-                return "Could not process image."
+                return "Görsel işlenemedi."
             
             # Ensure RGB (Fix for YOLO 4-channel error and JPEG saving)
             if image.mode != "RGB":
                 image = image.convert("RGB")
-
-            if not image:
-                return "Could not process image."
 
             # Trace Log for Debugging
             trace = ["🔍 **Sistem Düşünce Günlüğü (Debug)**"]
@@ -395,6 +419,7 @@ class Orchestrator:
                 seen_names.add(p_name)
                 unique_products.append(hit)
                 
+                # Add score to trace
                 trace.append(f"  * Aday: {p_name} (Skor: {score:.4f})")
                 
                 if len(unique_products) >= 5:
@@ -403,57 +428,48 @@ class Orchestrator:
             trace.append(f"- 🧹 Filtreleme: Stok ve kopyalar temizlendi. Geriye {len(unique_products)} aday kaldı.")
 
             if not unique_products:
-                return "Üzgünüm, buna benzer stokta olan bir ürün bulamadım.\n\n" + "\n".join(trace)
+                return "Üzgünüm, şu an stoklarımızda buna benzer bir parça bulamadım. 😔 Ama yeni sezon ürünlerimize göz atmak istersen link profilimizde! 💖" + ("\n\n" + "\n".join(trace) if DEBUG_MODE else "")
             
-            # High Confidence Check (GPT-4o Verification) - DISABLED
-            # candidates_for_gpt = unique_products[:5]
-            # best_match_id, reasoning = self.verify_match_with_gpt(image, candidates_for_gpt)
+            # --- Generate Response ---
+            # We have unique_products (Best Match + Alternatives)
+            best_match = unique_products[0].payload
+            alternatives = unique_products[1:]
             
-            # Fallback to Top 1 Vector Match
-            best_match_id = str(unique_products[0].payload.get('id', ''))
-            reasoning = "En yüksek vektör benzerlik skoru."
+            # Construct a friendly message
+            response_text = f"Harika bir stil! ✨ Paylaştığın görsele en çok benzeyen modelimiz bu:\n\n"
             
-            matched_product = None
-            response_text = ""
-            if best_match_id:
-                # Find the product with this ID
-                matched_product = unique_products[0].payload
+            # Best Match Info
+            name = best_match.get('name', 'Ürün')
+            price = best_match.get('price', 0)
+            url = best_match.get('image_url')
             
-            if matched_product:
-                p_name = matched_product.get('name', 'Bilinmeyen Ürün')
-                p_price = matched_product.get('price', 0)
-                
-                trace.append(f"- ✅ En İyi Eşleşme (Vektör): {p_name}")
-                response_text = f"Bunu buldum:\n**{p_name}** - {p_price} TL\n"
-                
-                if matched_product.get('image_url'):
-                    response_text += f"![Ürün]({matched_product['image_url']})\n"
-                
-                # Show others as alternatives
-                rest = unique_products[1:]
-                if rest:
-                     response_text += "\nDiğer benzer seçenekler:\n"
-                     for hit in rest[:3]:
-                         alt_name = hit.payload.get('name', 'Ürün')
-                         alt_price = hit.payload.get('price', 0)
-                         response_text += f"- {alt_name} ({alt_price} TL)\n"
-            else:
-                trace.append(f"- ℹ️ Eşleşme bulunamadı.")
+            response_text += f"👗 **{name}**\n💰 Fiyat: {price} TL\n"
+            if url:
+                response_text += f"![Ürün Görseli]({url})\n"
+            
+            response_text += "\n👇 Hemen incelemek için tıkla!\n(Link buraya gelecek)\n"
+            
+            if alternatives:
+                response_text += "\nAlternatif olarak şunlar da ilgini çekebilir:\n"
+                for alt in alternatives[:3]:
+                    alt_name = alt.payload.get('name', 'Ürün')
+                    alt_price = alt.payload.get('price', 0)
+                    response_text += f"- {alt_name} ({alt_price} TL)\n"
+            
+            response_text += "\nBaşka bir şey arıyorsan sormaktan çekinme! 💕"
 
-                response_text = "Tam olarak aynısını bulamasam da, benzer ürünler şunlar:\n"
-                for hit in unique_products[:5]:
-                    payload = hit.payload
-                    response_text += f"- **{payload['name']}** ({payload['price']} TL)\n"
-                    if payload.get('image_url'):
-                        response_text += f"  ![Görsel]({payload['image_url']})\n"
+            # Append trace only if DEBUG_MODE is on
+            if DEBUG_MODE:
+                response_text += "\n\n---\n" + "\n".join(trace)
 
-            # Append Trace Log to Response
-            full_response = response_text + "\n\n---\n" + "\n".join(trace)
-            return full_response
+            return response_text
             
         except Exception as e:
             print(f"Error handling image: {e}")
-            return f"Error processing image: {e}"
+            err_msg = "Bir teknik aksaklık oldu, lütfen tekrar dene. 🙏"
+            if DEBUG_MODE:
+                err_msg += f"\nError: {e}"
+            return err_msg
 
     def handle_link(self, url):
         print(f"Handling Link: {url}")
