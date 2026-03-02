@@ -410,7 +410,7 @@ class Orchestrator:
             # best_match_id, reasoning = self.verify_match_with_gpt(image, candidates_for_gpt)
             
             # Fallback to Top 1 Vector Match
-            best_match_id = str(unique_products[0].payload['id'])
+            best_match_id = str(unique_products[0].payload.get('id', ''))
             reasoning = "En yüksek vektör benzerlik skoru."
             
             matched_product = None
@@ -420,8 +420,12 @@ class Orchestrator:
                 matched_product = unique_products[0].payload
             
             if matched_product:
-                trace.append(f"- ✅ En İyi Eşleşme (Vektör): {matched_product['name']}")
-                response_text = f"Bunu buldum:\n**{matched_product['name']}** - {matched_product['price']} TL\n"
+                p_name = matched_product.get('name', 'Bilinmeyen Ürün')
+                p_price = matched_product.get('price', 0)
+                
+                trace.append(f"- ✅ En İyi Eşleşme (Vektör): {p_name}")
+                response_text = f"Bunu buldum:\n**{p_name}** - {p_price} TL\n"
+                
                 if matched_product.get('image_url'):
                     response_text += f"![Ürün]({matched_product['image_url']})\n"
                 
@@ -430,7 +434,9 @@ class Orchestrator:
                 if rest:
                      response_text += "\nDiğer benzer seçenekler:\n"
                      for hit in rest[:3]:
-                         response_text += f"- {hit.payload['name']} ({hit.payload['price']} TL)\n"
+                         alt_name = hit.payload.get('name', 'Ürün')
+                         alt_price = hit.payload.get('price', 0)
+                         response_text += f"- {alt_name} ({alt_price} TL)\n"
             else:
                 trace.append(f"- ℹ️ Eşleşme bulunamadı.")
 
