@@ -1,0 +1,6 @@
+/.env
+/ikas-urunler.csv
+/venv/
+/test_images/
+/debug_tools/
+/yolov8n.pt

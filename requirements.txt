@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+sentence-transformers
+qdrant-client
+openai
+pillow
+python-dotenv
+pandas
+ultralytics
