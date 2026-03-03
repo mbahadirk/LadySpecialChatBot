@@ -48,6 +48,11 @@ class InstagramSync:
                     media_id = item.get("id", "")
 
                     try:
+                        # Önce bu post zaten var mı kontrol et
+                        existing = conn.execute(
+                            "SELECT id FROM instagram_posts WHERE shortcode = ?", (shortcode,)
+                        ).fetchone()
+                        
                         conn.execute("""
                             INSERT INTO instagram_posts (id, shortcode, caption, media_url, permalink, created_at, updated_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -60,7 +65,8 @@ class InstagramSync:
                             datetime.utcnow().isoformat(), datetime.utcnow().isoformat()
                         ))
                         conn.commit()
-                        count += 1
+                        if not existing:
+                            count += 1  # Sadece yeni eklenenler sayılır
                     except Exception as e:
                         print(f"[IG Sync] Kayit hatasi: {e}")
 
@@ -70,7 +76,7 @@ class InstagramSync:
                 break
 
         conn.close()
-        print(f"[IG Sync] Bitti. Toplam guncellenen/eklenen post: {count}")
+        print(f"[IG Sync] Bitti. Yeni eklenen post: {count}")
         return {"synced": count}
 
 if __name__ == "__main__":

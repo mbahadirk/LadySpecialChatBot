@@ -41,6 +41,7 @@ class OrderSession:
     items: list = field(default_factory=list)  # list[OrderItem]
     customer_info: dict = field(default_factory=dict)
     # customer_info yapısı: {"name": "", "phone": "", "address": ""}
+    payment_method: str = ""  # "kapida_odeme", "havale", "eft"
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -50,6 +51,7 @@ class OrderService:
     STAGES = [
         "product_selection",
         "variant_selection",
+        "payment_selection",
         "customer_info",
         "confirmation",
         "completed",
@@ -132,6 +134,15 @@ class OrderService:
             session.items[item_index].variant_info = variant_info
             print(f"[OrderService] 🏷️ Varyant: {session.items[item_index].product_name} → {variant_info}")
 
+    # ─── Ödeme Yöntemi ───
+
+    def set_payment_method(self, platform: str, sender_id: str, method: str):
+        """Ödeme yöntemini set eder."""
+        session = self.get_session(platform, sender_id)
+        if session:
+            session.payment_method = method
+            print(f"[OrderService] 💳 Ödeme yöntemi: {method}")
+
     # ─── Müşteri Bilgileri ───
 
     def set_customer_info(self, platform: str, sender_id: str, info: dict):
@@ -169,7 +180,15 @@ class OrderService:
 
         grand_total = subtotal + shipping
         lines.append(f"TOPLAM: {grand_total:.2f} TL")
-        lines.append(f"\n💳 Ödeme: Kapıda Ödeme")
+
+        # Ödeme yöntemi
+        payment_labels = {
+            "kapida_odeme": "Kapıda Ödeme",
+            "havale": "Havale",
+            "eft": "EFT",
+        }
+        payment_label = payment_labels.get(session.payment_method, session.payment_method or "Belirtilmedi")
+        lines.append(f"\n💳 Ödeme: {payment_label}")
 
         info = session.customer_info
         if info:
@@ -207,7 +226,7 @@ class OrderService:
             "subtotal": subtotal,
             "shipping_cost": shipping,
             "grand_total": subtotal + shipping,
-            "payment_method": "kapida_odeme",
+            "payment_method": session.payment_method or "",
             "customer_info": session.customer_info,
             "stage": session.stage,
         }
@@ -243,8 +262,8 @@ class OrderService:
                     subtotal,
                     shipping,
                     grand_total,
-                    "kapida_odeme",
-                    "pending",
+                    session.payment_method or "kapida_odeme",
+                    "pending" if session.payment_method == "kapida_odeme" else "awaiting_payment",
                     datetime.utcnow().isoformat(),
                 )
             )

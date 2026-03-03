@@ -212,18 +212,21 @@ class InstagramService:
                 msg_type = "text"
 
                 if attachments:
-                    att = attachments[0]
-                    att_type = att.get("type", "")
-                    if att_type == "image":
-                        msg_type = "image"
-                        media_url = att.get("payload", {}).get("url")
-                    elif att_type == "video":
-                        msg_type = "video"
-                        media_url = att.get("payload", {}).get("url")
-                    elif att_type == "share":
-                        # Story share / reel share
-                        msg_type = "share"
-                        media_url = att.get("payload", {}).get("url")
+                    for att in attachments:
+                        att_type = att.get("type", "")
+                        payload_url = att.get("payload", {}).get("url")
+                        
+                        if att_type in ("image", "ig_post"):
+                            msg_type = "share" if msg_type == "share" else "image"
+                            media_url = payload_url
+                        elif att_type == "video":
+                            msg_type = "share" if msg_type == "share" else "video"
+                            if not media_url:
+                                media_url = payload_url
+                        elif att_type == "share":
+                            msg_type = "share"
+                            if payload_url and "instagram.com" in payload_url and payload_url not in text:
+                                text = f"{text} {payload_url}".strip()
 
                 reply_to = message.get("reply_to", {})
                 reply_to_mid = reply_to.get("mid", None) if isinstance(reply_to, dict) else None

@@ -203,14 +203,18 @@ async def receive_webhook(request: Request):
                     print("[INFO] Instagram event (mesaj degil), atlaniyor.")
                     continue
 
-                # Echo check — Yöneticinin gönderdiği mesajlar
+                # Echo check — Sayfa tarafından gönderilen mesajlar
                 is_echo = msg_event.get("message", {}).get("is_echo", False)
                 if is_echo:
-                    # Bu mesajı gönderen yönetici, alıcı müşteri
                     customer_id = msg_event.get("recipient", {}).get("id", "")
                     if customer_id:
-                        chatbot.activate_admin_takeover("instagram", customer_id)
-                        print(f"[INFO] IG Admin takeover tetiklendi: {customer_id}")
+                        # Eğer bot son 15 saniye içinde bu kullanıcıya mesaj gönderdiyse, bu bir bot echo'sudur
+                        if chatbot.is_recent_bot_message("instagram", customer_id, window_seconds=15):
+                            print(f"[INFO] Bot echo mesaji (zaman bazli), atlaniyor.")
+                        else:
+                            # Aksi takdirde yönetici tarafından manuel gönderilmiş bir mesajdır
+                            chatbot.activate_admin_takeover("instagram", customer_id)
+                            print(f"[INFO] IG Admin takeover tetiklendi: {customer_id}")
                     else:
                         print("[INFO] IG echo: recipient ID bulunamadı.")
                     continue

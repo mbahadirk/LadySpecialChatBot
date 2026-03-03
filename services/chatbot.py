@@ -51,6 +51,11 @@ class ChatBot:
         self.image_service = ImageService()
         self.order_service = OrderService()
 
+        # Bot'un kendi gönderdiği mesajların zamanları (platform_sender_id -> timestamp)
+        # Bu, bot echo'ları ile admin mesajlarını ayırmak için kullanılır
+        import time
+        self._bot_last_send: dict[str, float] = {}
+
         # Bekleyen görseller (in-memory, hız için)
         # {platform_sender_id: {"image_path": str, "task": asyncio.Task, "user_id": int, "platform": str}}
         self._pending_images: dict = {}
@@ -142,9 +147,13 @@ class ChatBot:
         if msg_type == "image":
             return await self._handle_ig_image(sender_id, user_id, parsed)
         elif msg_type == "share":
-            # Share genelde sadece URL gönderir. Biz bunu text olarak işleyip "link kontrolü" yapalım
-            parsed["text"] = f'{parsed.get("text", "")} {parsed.get("media_url", "")}'.strip()
-            return await self._handle_text_message("instagram", sender_id, user_id, parsed)
+            # Share mesajlarında Meta bir önizleme görseli (media_url) sunar. 
+            # Varsa bunu görsel tabanlı ürün araması olarak değerlendir.
+            if parsed.get("media_url"):
+                return await self._handle_ig_image(sender_id, user_id, parsed)
+            else:
+                # Eğer görsel yoksa, normal metin olarak link ayıklamaya gönder
+                return await self._handle_text_message("instagram", sender_id, user_id, parsed)
         elif msg_type == "text" and parsed.get("text"):
             return await self._handle_text_message("instagram", sender_id, user_id, parsed)
         else:
@@ -243,9 +252,9 @@ class ChatBot:
 
         if text:
             print(f"[ChatBot] IG Gorsel + text: '{text}'")
-            response = await self._process_image_with_text(user_id, image_path, text)
+            response = await self._process_image_with_text(user_id, image_path, text, base_platform="instagram", message_id=parsed.get("message_id"))
             if response:
-                await self.instagram_service.send_text_message(sender_id, response)
+                await self._send_message("instagram", sender_id, response)
             return response
         else:
             print(f"[ChatBot] IG Gorsel textsiz. {IMAGE_WAIT_TIMEOUT}s bekleme baslatiliyor...")
@@ -341,16 +350,6 @@ class ChatBot:
                     await self._send_message(platform, sender_id, response)
                 return response
 
-        # 0. SİPARİŞ OTURUMU KONTROLÜ
-        # Aktif sipariş oturumu varsa mesajı sipariş akışına yönlendir
-        order_session = self.order_service.get_session(platform, sender_id)
-        if order_session:
-            print(f"[ChatBot] Aktif sipariş oturumu mevcut (aşama: {order_session.stage}), sipariş akışına yönlendiriliyor...")
-            response = await self._process_order_flow(platform, sender_id, user_id, text, msg_id)
-            if response:
-                await self._send_message(platform, sender_id, response)
-            return response
-
         # 1. LİNK KONTROLÜ (Ürün linki gönderildiyse görselini çek ve arat)
         url_match = re.search(r'(https?://[^\s]+)', text)
         if url_match:
@@ -362,7 +361,7 @@ class ChatBot:
             if ig_match:
                 shortcode = ig_match.group(1)
                 conn = get_connection()
-                row = conn.execute("SELECT caption FROM instagram_posts WHERE shortcode = ?", (shortcode,)).fetchone()
+                row = conn.execute("SELECT caption, media_url FROM instagram_posts WHERE shortcode = ?", (shortcode,)).fetchone()
                 conn.close()
                 if row and row["caption"]:
                     caption = row["caption"]
@@ -384,10 +383,28 @@ class ChatBot:
                             if response:
                                 await self._send_message(platform, sender_id, response)
                             return response
+                    
+                    # SKU bulunamadı ama IG DB'de media_url varsa → görseli indir ve arat
+                    ig_media_url = row.get("media_url", "") if row else ""
+                    if ig_media_url:
+                        print(f"[ChatBot] IG SKU eşleşmedi, post görseli ile aranıyor...")
+                        try:
+                            async with httpx.AsyncClient(timeout=15.0) as client:
+                                img_resp = await client.get(ig_media_url)
+                                if img_resp.status_code == 200:
+                                    image_path = self.image_service.save_image(user_id, img_resp.content)
+                                    print(f"[ChatBot] IG post görseli kaydedildi: {image_path}")
+                                    response = await self._process_image_with_text(user_id, image_path, text, base_platform=platform, message_id=msg_id)
+                                    if response:
+                                        await self._send_message(platform, sender_id, response)
+                                    return response
+                                else:
+                                    print(f"[ChatBot] IG post görseli indirilemedi: {img_resp.status_code}")
+                        except Exception as e:
+                            print(f"[ChatBot] IG post görseli indirme hatası: {e}")
                             
-            # (Eski fallback: diğer linklerin og:image arama mantığı)
+            # (Fallback: diğer linklerin og:image arama mantığı)
             try:
-                # HTTPX default params
                 async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                     resp = await client.get(extracted_url)
                     if resp.status_code == 200:
@@ -411,6 +428,16 @@ class ChatBot:
             except Exception as e:
                 print(f"[ChatBot] Link işleme hatası: {e}")
                 # Hata olursa kırılma, normal metin işlemeye devam et
+
+        # 0. SİPARİŞ OTURUMU KONTROLÜ (link kontrolünden SONRA)
+        # Aktif sipariş oturumu varsa mesajı sipariş akışına yönlendir
+        order_session = self.order_service.get_session(platform, sender_id)
+        if order_session:
+            print(f"[ChatBot] Aktif sipariş oturumu mevcut (aşama: {order_session.stage}), sipariş akışına yönlendiriliyor...")
+            response = await self._process_order_flow(platform, sender_id, user_id, text, msg_id)
+            if response:
+                await self._send_message(platform, sender_id, response)
+            return response
 
         # 2. RACE CONDITION (ÇİFT MESAJ) KORUMASI
         # Kullanıcılar "önce metin, sonra görsel" atarsa, iki ayrı bildirim gelir.
@@ -618,6 +645,9 @@ class ChatBot:
         elif stage == "variant_selection":
             response = await self._order_variant_selection(platform, sender_id, user_id, text, history, extracted)
 
+        elif stage == "payment_selection":
+            response = await self._order_payment_selection(platform, sender_id, user_id, text, history, extracted)
+
         elif stage == "customer_info":
             response = await self._order_customer_info(platform, sender_id, user_id, text, history, extracted)
 
@@ -669,17 +699,33 @@ class ChatBot:
         """Beden/renk seçimi aşaması."""
         variant = extracted.get("variant")
         if variant:
-            # Varyant seçildi — kaydet ve customer_info aşamasına geç
+            # Varyant seçildi — kaydet ve payment_selection aşamasına geç
             session = self.order_service.get_session(platform, sender_id)
             if session and session.items:
                 self.order_service.set_variant(platform, sender_id, len(session.items) - 1, variant)
-            self.order_service.update_stage(platform, sender_id, "customer_info")
+            self.order_service.update_stage(platform, sender_id, "payment_selection")
 
         order_data = self.order_service.get_order_data(platform, sender_id)
         session = self.order_service.get_session(platform, sender_id)
         return self.llm_service.generate_order_flow_response(
             user_message=text,
             stage=session.stage if session else "variant_selection",
+            order_data=order_data,
+            conversation_history=history
+        )
+
+    async def _order_payment_selection(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Ödeme yöntemi seçimi aşaması."""
+        payment = extracted.get("payment_method")
+        if payment and payment in ("kapida_odeme", "havale", "eft"):
+            self.order_service.set_payment_method(platform, sender_id, payment)
+            self.order_service.update_stage(platform, sender_id, "customer_info")
+
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        session = self.order_service.get_session(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=text,
+            stage=session.stage if session else "payment_selection",
             order_data=order_data,
             conversation_history=history
         )
@@ -733,6 +779,8 @@ class ChatBot:
             elif change_field in ("product",):
                 self.order_service.clear_products(platform, sender_id)
                 self.order_service.update_stage(platform, sender_id, "product_selection")
+            elif change_field in ("payment",):
+                self.order_service.update_stage(platform, sender_id, "payment_selection")
             else:
                 self.order_service.update_stage(platform, sender_id, "customer_info")
 
@@ -760,16 +808,30 @@ class ChatBot:
 
         # Onay geldi mi?
         if extracted.get("confirms_order"):
+            session = self.order_service.get_session(platform, sender_id)
+            payment = session.payment_method if session else "kapida_odeme"
             order_id = self.order_service.complete_order(platform, sender_id)
             if order_id:
-                response = (
-                    f"Siparişiniz başarıyla oluşturuldu! 🎉\n\n"
-                    f"Sipariş No: #{order_id}\n"
-                    f"Ödeme Yöntemi: Kapıda Ödeme\n\n"
-                    f"Siparişiniz en kısa sürede hazırlanıp kargoya verilecektir. "
-                    f"Teşekkür ederiz! 💕\n\n"
-                    f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
-                )
+                if payment == "kapida_odeme":
+                    response = (
+                        f"Siparişiniz başarıyla oluşturuldu! 🎉\n\n"
+                        f"Sipariş No: #{order_id}\n"
+                        f"Ödeme Yöntemi: Kapıda Ödeme\n\n"
+                        f"Siparişiniz en kısa sürede hazırlanıp kargoya verilecektir. "
+                        f"Teşekkür ederiz! 💕\n\n"
+                        f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
+                    )
+                else:
+                    # Havale veya EFT
+                    method_label = "Havale" if payment == "havale" else "EFT"
+                    response = (
+                        f"Siparişiniz alınmıştır! 🎉\n\n"
+                        f"Sipariş No: #{order_id}\n"
+                        f"Ödeme Yöntemi: {method_label}\n\n"
+                        f"Ödeme bilgileri için yöneticimiz kısa süre içinde size dönecektir. "
+                        f"Teşekkür ederiz! 💕\n\n"
+                        f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
+                    )
                 return response
             else:
                 return "Sipariş oluşturulurken bir hata oluştu. Lütfen tekrar deneyin."
@@ -790,6 +852,9 @@ class ChatBot:
 
     async def _send_message(self, platform: str, sender_id: str, text: str):
         """Platforma göre mesaj gönderir."""
+        import time
+        self._bot_last_send[f"{platform}_{sender_id}"] = time.time()
+        
         if platform == "whatsapp":
             await self.whatsapp_service.send_text_message(sender_id, text)
         elif platform == "instagram":
@@ -820,6 +885,13 @@ class ChatBot:
     #  ADMIN TAKEOVER (Yönetici Devralma)
     # ══════════════════════════════════════════
 
+    def is_recent_bot_message(self, platform: str, sender_id: str, window_seconds: int = 15) -> bool:
+        """Belirtilen platformdaki kullanıcıya bot son window_seconds içinde mesaj gönderdi mi?"""
+        import time
+        key = f"{platform}_{sender_id}"
+        last_time = self._bot_last_send.get(key, 0)
+        return (time.time() - last_time) < window_seconds
+
     def activate_admin_takeover(self, platform: str, customer_sender_id: str):
         """
         Yönetici bir müşteriye mesaj attığında çağrılır.
@@ -827,6 +899,7 @@ class ChatBot:
         """
         key = self._get_pending_key(platform, customer_sender_id)
         now = datetime.utcnow()
+
 
         if key in self._admin_takeover:
             self._admin_takeover[key]["last_echo_at"] = now

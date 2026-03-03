@@ -241,7 +241,10 @@ class LLMService:
             order_context += "\nSeçilen Ürünler:\n"
             for item in order_data["items"]:
                 variant = f" ({item['variant_info']})" if item.get("variant_info") else ""
-                order_context += f"- {item['product_name']}{variant} — {item['unit_price']} TL\n"
+                qty = item.get("quantity", 1)
+                unit_price = item.get("unit_price", 0.0)
+                row_total = qty * unit_price
+                order_context += f"- {item['product_name']}{variant} — {unit_price:.2f} TL x {qty} adet = {row_total:.2f} TL\n"
             order_context += f"\nAra Toplam: {order_data.get('subtotal', 0):.2f} TL"
             shipping = order_data.get('shipping_cost', 0)
             if shipping > 0:
@@ -290,10 +293,11 @@ class LLMService:
                 "- phone: Telefon numarası\n"
                 "- address: Adres\n"
                 "- variant: Beden veya renk bilgisi (örn: 'M', 'S/Siyah', '38')\n"
+                "- payment_method: Ödeme yöntemi. Kapıda ödeme → 'kapida_odeme', Havale → 'havale', EFT → 'eft'. null ise belirlenmemiş\n"
                 "- wants_cancel: Müşteri siparişi iptal etmek istiyor mu? (true/false)\n"
                 "- confirms_order: Müşteri siparişi onaylıyor mu? (true/false)\n"
                 "- wants_change: Müşteri siparişteki bir bilgiyi değiştirmek istiyor mu? (true/false)\n"
-                "- change_field: Değiştirmek istenen alan (address/phone/name/variant/product veya null)\n\n"
+                "- change_field: Değiştirmek istenen alan (address/phone/name/variant/product/payment veya null)\n\n"
                 f"Mevcut sipariş aşaması: {stage}\n"
             )
 
