@@ -73,6 +73,7 @@ def init_db():
             image_url       TEXT,
             all_image_urls  TEXT,
             variants_json   TEXT,
+            skus            TEXT,
             is_active       INTEGER DEFAULT 1,
             last_synced     TEXT NOT NULL DEFAULT (datetime('now')),
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -96,6 +97,52 @@ def init_db():
         )
     """)
 
+    # ─── Instagram Gönderileri ───
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS instagram_posts (
+            id              TEXT PRIMARY KEY,
+            shortcode       TEXT UNIQUE,
+            caption         TEXT,
+            media_url       TEXT,
+            permalink       TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+    # ─── Siparişler Tablosu ───
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL,
+            platform        TEXT NOT NULL,
+            customer_name   TEXT,
+            customer_phone  TEXT,
+            customer_address TEXT,
+            total_price     REAL DEFAULT 0,
+            shipping_cost   REAL DEFAULT 0,
+            grand_total     REAL DEFAULT 0,
+            payment_method  TEXT DEFAULT 'kapida_odeme',
+            status          TEXT DEFAULT 'pending',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # ─── Sipariş Kalemleri Tablosu ───
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id        INTEGER NOT NULL,
+            product_id      TEXT,
+            product_name    TEXT NOT NULL,
+            variant_info    TEXT,
+            quantity        INTEGER DEFAULT 1,
+            unit_price      REAL DEFAULT 0,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        )
+    """)
+
     # ─── Migration: Eski tabloya image_path ekleme ───
     try:
         cursor.execute("ALTER TABLE messages ADD COLUMN image_path TEXT")
@@ -106,6 +153,12 @@ def init_db():
     try:
         cursor.execute("ALTER TABLE messages ADD COLUMN message_id TEXT")
         print("[DB] message_id kolonu eklendi (migration).")
+    except Exception:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE products ADD COLUMN skus TEXT")
+        print("[DB] skus kolonu eklendi (migration).")
     except Exception:
         pass
 

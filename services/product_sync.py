@@ -190,11 +190,15 @@ class ProductSync:
             variants = []
             all_images = []
             seen_images = set()
+            skus_set = set()
             total_stock = 0
             min_price = float('inf')
 
             for var_elem in elem.findall("variants/variant"):
                 vid = var_elem.findtext("id", "")
+                sku = var_elem.findtext("sku", "")
+                if sku:
+                    skus_set.add(sku)
 
                 # Stok
                 stock = 0
@@ -261,6 +265,7 @@ class ProductSync:
                 "image_url": all_images[0]["url"] if all_images else "",
                 "all_images": all_images,
                 "variants": variants,
+                "skus": ",".join(sorted(list(skus_set)))
             }
 
         except Exception as e:
@@ -288,14 +293,15 @@ class ProductSync:
                 INSERT OR REPLACE INTO products
                 (id, name, slug, description, category, price, currency,
                  total_stock, image_url, all_image_urls, variants_json,
-                 is_active, last_synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 skus, is_active, last_synced)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             """, (
                 p["id"], p["name"], p["slug"], p["description"],
                 p["category"], p["price"], p["currency"],
                 p["total_stock"], p["image_url"],
                 json.dumps([img["url"] for img in p["all_images"]]),
                 json.dumps(p["variants"], ensure_ascii=False),
+                p["skus"],
                 datetime.utcnow().isoformat()
             ))
 
@@ -328,6 +334,8 @@ class ProductSync:
             changed = True
         if db_row["name"] != xml_p["name"]:
             changed = True
+        if db_row.get("skus", "") != xml_p.get("skus", ""):
+            changed = True
 
         if not changed:
             return False
@@ -337,12 +345,13 @@ class ProductSync:
             conn.execute("""
                 UPDATE products SET
                     name = ?, price = ?, total_stock = ?,
-                    variants_json = ?, last_synced = ?,
+                    variants_json = ?, skus = ?, last_synced = ?,
                     image_url = ?, all_image_urls = ?
                 WHERE id = ?
             """, (
                 xml_p["name"], xml_p["price"], xml_p["total_stock"],
                 json.dumps(xml_p["variants"], ensure_ascii=False),
+                xml_p["skus"],
                 datetime.utcnow().isoformat(),
                 xml_p["image_url"],
                 json.dumps([img["url"] for img in xml_p["all_images"]]),

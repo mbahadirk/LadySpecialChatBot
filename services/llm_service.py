@@ -212,6 +212,114 @@ class LLMService:
             return user_message  # Fallback: mesajın kendisini kullan
 
     # ──────────────────────────────────────
+    #  Sipariş Akışı Metotları
+    # ──────────────────────────────────────
+
+    def generate_order_flow_response(
+        self,
+        user_message: str,
+        stage: str,
+        order_data: dict,
+        conversation_history: list[dict]
+    ) -> str:
+        """
+        Sipariş akışındaki her aşama için LLM cevabı üretir.
+
+        Args:
+            user_message: Müşterinin mesajı
+            stage: Mevcut sipariş aşaması
+            order_data: Sipariş verisi (ürünler, fiyatlar, müşteri bilgileri)
+            conversation_history: Konuşma geçmişi
+        """
+        system_prompt = PromptManager.get_system_prompt()
+        order_flow_prompt = PromptManager.get_order_flow_prompt()
+
+        # Sipariş verisini metin olarak hazırla
+        order_context = f"\n\nMEVCUT SİPARİŞ DURUMU:\nAşama: {stage}\n"
+
+        if order_data.get("items"):
+            order_context += "\nSeçilen Ürünler:\n"
+            for item in order_data["items"]:
+                variant = f" ({item['variant_info']})" if item.get("variant_info") else ""
+                order_context += f"- {item['product_name']}{variant} — {item['unit_price']} TL\n"
+            order_context += f"\nAra Toplam: {order_data.get('subtotal', 0):.2f} TL"
+            shipping = order_data.get('shipping_cost', 0)
+            if shipping > 0:
+                order_context += f"\nKargo: {shipping:.2f} TL"
+            else:
+                order_context += "\nKargo: ÜCRETSİZ"
+            order_context += f"\nToplam: {order_data.get('grand_total', 0):.2f} TL"
+
+        if order_data.get("customer_info"):
+            info = order_data["customer_info"]
+            order_context += "\n\nMüşteri Bilgileri:\n"
+            if info.get("name"): order_context += f"İsim: {info['name']}\n"
+            if info.get("phone"): order_context += f"Telefon: {info['phone']}\n"
+            if info.get("address"): order_context += f"Adres: {info['address']}\n"
+
+        messages = [
+            {"role": "system", "content": f"{system_prompt}\n\n{order_flow_prompt}{order_context}"}
+        ]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": user_message})
+
+        return self._call_llm(messages)
+
+    def extract_order_info(self, user_message: str, stage: str, conversation_history: list[dict] = None) -> dict:
+        """
+        Müşterinin mesajından sipariş bilgilerini çıkarır.
+
+        Returns:
+            {
+                "name": "Ali Yılmaz" | null,
+                "phone": "05551234567" | null,
+                "address": "..." | null,
+                "variant": "M" | null,
+                "wants_cancel": false,
+                "confirms_order": false,
+                "wants_change": false,
+                "change_field": null  # "address", "phone", "name", "variant", "product"
+            }
+        """
+        try:
+            extract_prompt = (
+                "Müşterinin mesajından aşağıdaki bilgileri JSON formatında çıkar. "
+                "Eğer bir bilgi mesajda yoksa null yaz. Sadece JSON döndür, başka bir şey yazma.\n\n"
+                "Çıkarılacak alanlar:\n"
+                "- name: İsim ve soyisim\n"
+                "- phone: Telefon numarası\n"
+                "- address: Adres\n"
+                "- variant: Beden veya renk bilgisi (örn: 'M', 'S/Siyah', '38')\n"
+                "- wants_cancel: Müşteri siparişi iptal etmek istiyor mu? (true/false)\n"
+                "- confirms_order: Müşteri siparişi onaylıyor mu? (true/false)\n"
+                "- wants_change: Müşteri siparişteki bir bilgiyi değiştirmek istiyor mu? (true/false)\n"
+                "- change_field: Değiştirmek istenen alan (address/phone/name/variant/product veya null)\n\n"
+                f"Mevcut sipariş aşaması: {stage}\n"
+            )
+
+            messages = [{"role": "system", "content": extract_prompt}]
+            if conversation_history:
+                messages.extend(conversation_history[-6:])
+            messages.append({"role": "user", "content": user_message})
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=200,
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            raw = response.choices[0].message.content.strip()
+            import json
+            result = json.loads(raw)
+            print(f"[LLM] Çıkarılan sipariş bilgisi: {result}")
+            return result
+
+        except Exception as e:
+            print(f"[LLM] Sipariş bilgisi çıkarma hatası: {e}")
+            return {}
+
+    # ──────────────────────────────────────
     #  Görsel Yanıt Metotları
     # ──────────────────────────────────────
 
@@ -239,6 +347,33 @@ class LLMService:
             "content": (
                 f"Musteri bir urun gorseli gonderdi ve su mesaji yazdi: \"{user_message}\"\n\n"
                 f"{results_text}"
+            )
+        })
+
+        return self._call_llm(messages)
+
+    def generate_instagram_link_response(
+        self,
+        user_message: str,
+        search_results: list[dict],
+        conversation_history: list[dict]
+    ) -> str:
+        """
+        Instagram linki atıldığında ve SKU eşleşmeleri bulunduğunda cevap üretir.
+        """
+        system_prompt = PromptManager.get_system_prompt()
+        # image_response_prompt can be reused or we generate instructions dynamically
+        messages = [
+            {"role": "system", "content": f"{system_prompt}\n\nMüşteri bir Instagram postu gönderdi. Sistem bu postun açıklamasını taradı ve aşağıdaki ürünleri buldu. Eğer tek bir ürün varsa, ürünle ilgili bilgi ver. Eğer birden fazla ürün bulunduysa, müşteriye bu linkteki hangi ürünle (örneğin Alt mı Üst mü) ilgilendiğini sor. Müşterinin ek sorusu varsa onlara da cevap ver."}
+        ]
+        messages.extend(conversation_history)
+        
+        results_text = self._format_image_results_for_llm(search_results)
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Müşteri şu mesajı attı: \"{user_message}\"\n\n"
+                f"Postun açıklamasından tespit edilen ürünler:\n{results_text}"
             )
         })
 

@@ -16,6 +16,7 @@ Desteklenen platformlar: WhatsApp, Instagram, Web
 
 import os
 import re
+from datetime import datetime, timedelta
 import asyncio
 import httpx
 
@@ -28,11 +29,13 @@ from services.llm_service import LLMService
 from services.whatsapp_service import WhatsAppService
 from services.instagram_service import InstagramService
 from services.image_service import ImageService
+from services.order_service import OrderService
 
 load_dotenv()
 
 # Konfigürasyon
 IMAGE_WAIT_TIMEOUT = int(os.getenv("IMAGE_WAIT_SECONDS", "60"))
+ADMIN_TAKEOVER_TIMEOUT = int(os.getenv("ADMIN_TAKEOVER_TIMEOUT_MINUTES", "30"))
 
 
 class ChatBot:
@@ -46,10 +49,15 @@ class ChatBot:
         self.whatsapp_service = WhatsAppService()
         self.instagram_service = InstagramService()
         self.image_service = ImageService()
+        self.order_service = OrderService()
 
         # Bekleyen görseller (in-memory, hız için)
         # {platform_sender_id: {"image_path": str, "task": asyncio.Task, "user_id": int, "platform": str}}
         self._pending_images: dict = {}
+
+        # Admin takeover: Yönetici bir müşteriyle konuşurken bot'u sustur
+        # {platform_sender_id: {"started_at": datetime, "last_echo_at": datetime}}
+        self._admin_takeover: dict = {}
 
         # İşlenmiş mesaj ID'leri (duplicate webhook koruması)
         self._processed_message_ids: set = set()
@@ -57,6 +65,7 @@ class ChatBot:
         print("[ChatBot] Baslatildi.")
         print(f"[ChatBot] Urun sayisi: {self.product_service.get_product_count()}")
         print(f"[ChatBot] Gorsel bekleme suresi: {IMAGE_WAIT_TIMEOUT}s")
+        print(f"[ChatBot] Admin takeover timeout: {ADMIN_TAKEOVER_TIMEOUT} dakika")
 
     # ══════════════════════════════════════════
     #  ANA GİRİŞ NOKTALARI
@@ -65,9 +74,15 @@ class ChatBot:
     async def handle_whatsapp_message(self, webhook_data: dict) -> str | None:
         """WhatsApp webhook verisini isler."""
 
+
         parsed = WhatsAppService.parse_incoming_message(webhook_data)
         if not parsed:
             print("[ChatBot] WA Parse sonucu: None")
+            return None
+
+        # Admin takeover: Eğer yönetici aktifse bu mesajı işleme
+        if self._is_admin_active("whatsapp", parsed["from"]):
+            print(f"[ChatBot] ⏸️ Admin takeover aktif (WA/{parsed['from']}), mesaj işlenmiyor.")
             return None
 
         sender_id = parsed["from"]
@@ -101,6 +116,11 @@ class ChatBot:
             print("[ChatBot] IG Parse sonucu: None")
             return None
 
+        # Admin takeover: Eğer yönetici aktifse bu mesajı işleme
+        if self._is_admin_active("instagram", parsed["from"]):
+            print(f"[ChatBot] ⏸️ Admin takeover aktif (IG/{parsed['from']}), mesaj işlenmiyor.")
+            return None
+
         sender_id = parsed["from"]
         msg_type = parsed["type"]
         msg_id = parsed.get("message_id", "")
@@ -119,8 +139,12 @@ class ChatBot:
         user = self.user_service.get_or_create_user("instagram", sender_id)
         user_id = user["id"]
 
-        if msg_type in ("image", "share"):
+        if msg_type == "image":
             return await self._handle_ig_image(sender_id, user_id, parsed)
+        elif msg_type == "share":
+            # Share genelde sadece URL gönderir. Biz bunu text olarak işleyip "link kontrolü" yapalım
+            parsed["text"] = f'{parsed.get("text", "")} {parsed.get("media_url", "")}'.strip()
+            return await self._handle_text_message("instagram", sender_id, user_id, parsed)
         elif msg_type == "text" and parsed.get("text"):
             return await self._handle_text_message("instagram", sender_id, user_id, parsed)
         else:
@@ -317,11 +341,51 @@ class ChatBot:
                     await self._send_message(platform, sender_id, response)
                 return response
 
+        # 0. SİPARİŞ OTURUMU KONTROLÜ
+        # Aktif sipariş oturumu varsa mesajı sipariş akışına yönlendir
+        order_session = self.order_service.get_session(platform, sender_id)
+        if order_session:
+            print(f"[ChatBot] Aktif sipariş oturumu mevcut (aşama: {order_session.stage}), sipariş akışına yönlendiriliyor...")
+            response = await self._process_order_flow(platform, sender_id, user_id, text, msg_id)
+            if response:
+                await self._send_message(platform, sender_id, response)
+            return response
+
         # 1. LİNK KONTROLÜ (Ürün linki gönderildiyse görselini çek ve arat)
         url_match = re.search(r'(https?://[^\s]+)', text)
         if url_match:
             extracted_url = url_match.group(1)
             print(f"[ChatBot] Mesajda link bulundu: {extracted_url}")
+            
+            # Instagram Linki kontrolü
+            ig_match = re.search(r'instagram\.com/(?:p|reel)/([^/?]+)', extracted_url)
+            if ig_match:
+                shortcode = ig_match.group(1)
+                conn = get_connection()
+                row = conn.execute("SELECT caption FROM instagram_posts WHERE shortcode = ?", (shortcode,)).fetchone()
+                conn.close()
+                if row and row["caption"]:
+                    caption = row["caption"]
+                    print(f"[ChatBot] IG DB Caption bulundu: {caption[:50]}...")
+                    found_skus = self.product_service.extract_skus_from_text(caption)
+                    if found_skus:
+                        products = self.product_service.get_products_by_skus(found_skus)
+                        if products:
+                            print(f"[ChatBot] IG Gönderisinden ürünler bulundu: {found_skus}")
+                            history = self.conversation_service.get_conversation_history(user_id)
+                            response = self.llm_service.generate_instagram_link_response(
+                                user_message=text,
+                                search_results=products,
+                                conversation_history=history
+                            )
+                            # Kullanıcının metniyle response kaydet
+                            self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                            self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                            if response:
+                                await self._send_message(platform, sender_id, response)
+                            return response
+                            
+            # (Eski fallback: diğer linklerin og:image arama mantığı)
             try:
                 # HTTPX default params
                 async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
@@ -383,7 +447,7 @@ class ChatBot:
         # 4. Normal metin akışı
         print(f"[ChatBot] Normal metin isleniyor ({platform}): '{text}'")
         response = await self._process_text_only(
-            platform=platform, user_id=user_id, user_message=text, message_id=msg_id
+            platform=platform, sender_id=sender_id, user_id=user_id, user_message=text, message_id=msg_id
         )
         if response:
             await self._send_message(platform, sender_id, response)
@@ -412,7 +476,7 @@ class ChatBot:
 
         return response
 
-    async def _process_text_only(self, platform: str, user_id: int, user_message: str, message_id: str = None) -> str:
+    async def _process_text_only(self, platform: str, user_id: int, user_message: str, message_id: str = None, sender_id: str = "") -> str:
         """Sadece metin mesaj işleme akışı."""
         history = self.conversation_service.get_conversation_history(user_id)
         is_returning = self.conversation_service.is_returning_user(user_id)
@@ -425,7 +489,8 @@ class ChatBot:
 
         response = await self._route_intent(
             intent=intent, user_message=user_message, user_id=user_id,
-            history=history, is_returning=is_returning
+            history=history, is_returning=is_returning,
+            platform=platform, sender_id=sender_id
         )
 
         self.conversation_service.save_message(
@@ -438,14 +503,15 @@ class ChatBot:
 
     async def _route_intent(
         self, intent: str, user_message: str, user_id: int,
-        history: list[dict], is_returning: bool
+        history: list[dict], is_returning: bool,
+        platform: str = "", sender_id: str = ""
     ) -> str:
         """Intent'e göre ilgili handler'a yönlendirir."""
 
         if intent == "product_inquiry":
             return self._handle_product_inquiry(user_message, user_id, history)
         elif intent == "order_request":
-            return self._handle_order_request(user_message, user_id, history)
+            return self._handle_order_request(platform, sender_id, user_message, user_id, history)
         elif intent == "greeting":
             return self.llm_service.generate_greeting_response(
                 user_message, is_returning, history
@@ -473,19 +539,250 @@ class ChatBot:
         print(f"[ChatBot] Urun bulunamadi: '{search_query}'")
         return self.llm_service.generate_product_response(user_message, [], history)
 
-    def _handle_order_request(self, user_message: str, user_id: int, history: list[dict]) -> str:
-        """Sipariş isteği akışı."""
+    def _handle_order_request(self, platform: str, sender_id: str, user_message: str, user_id: int, history: list[dict]) -> str:
+        """Sipariş isteği — oturum başlatır ve ürün arar."""
+        # Ürünü bulmaya çalış
         search_query = self.llm_service.extract_product_query(user_message, conversation_history=history)
         products = []
         if search_query:
             products = self.product_service.search_products(search_query, max_results=3)
 
-        if not products:
-            last_image = self.conversation_service.get_last_image_path(user_id)
-            if last_image:
-                return self.llm_service.generate_order_response(user_message, [], history)
+        # Sipariş oturumu başlat
+        session = self.order_service.start_session(platform, sender_id, user_id)
 
-        return self.llm_service.generate_order_response(user_message, products, history)
+        # Eğer ürün bulunduysa ilk ürünü oturuma ekle ve variant aşamasına geç
+        if products and len(products) == 1:
+            self.order_service.add_product(platform, sender_id, products[0])
+            self.order_service.update_stage(platform, sender_id, "variant_selection")
+        elif products:
+            # Birden fazla ürün bulundu, seçim yaptıralım
+            pass  # product_selection aşamasında kalacak, LLM seçim yaptıracak
+
+        order_data = self.order_service.get_order_data(platform, sender_id)
+
+        # Ürün bilgilerini order_data'ya ekle (LLM'in görmesi için)
+        if products:
+            product_info = self.llm_service._format_products_for_llm(products)
+            user_message_with_products = f"{user_message}\n\nBulunan ürünler:\n{product_info}"
+        else:
+            user_message_with_products = user_message
+
+        response = self.llm_service.generate_order_flow_response(
+            user_message=user_message_with_products,
+            stage=session.stage,
+            order_data=order_data,
+            conversation_history=history
+        )
+        return response
+
+    # ══════════════════════════════════════════
+    #  SİPARİŞ AKIŞI (Order Flow)
+    # ══════════════════════════════════════════
+
+    async def _process_order_flow(self, platform: str, sender_id: str, user_id: int, text: str, msg_id: str = None) -> str:
+        """
+        Aktif sipariş oturumunu yönetir.
+        Her mesajda LLM'den bilgi çıkarır ve aşamayı ilerletir.
+        """
+        session = self.order_service.get_session(platform, sender_id)
+        if not session:
+            return None
+
+        history = self.conversation_service.get_conversation_history(user_id)
+
+        # Kullanıcının mesajını kaydet
+        self.conversation_service.save_message(
+            user_id=user_id, platform=platform, role="user",
+            content=text, message_id=msg_id
+        )
+
+        # LLM ile mesajdan bilgi çıkar
+        extracted = self.llm_service.extract_order_info(text, session.stage, history)
+
+        # İptal kontrolü
+        if extracted.get("wants_cancel"):
+            self.order_service.cancel_session(platform, sender_id)
+            response = "Siparişiniz iptal edildi. İstediğiniz zaman yeniden sipariş verebilirsiniz! 🌸"
+            self.conversation_service.save_message(
+                user_id=user_id, platform=platform, role="assistant",
+                content=response, intent="order_request"
+            )
+            return response
+
+        # Aşamaya göre işle
+        stage = session.stage
+
+        if stage == "product_selection":
+            response = await self._order_product_selection(platform, sender_id, user_id, text, history, extracted)
+
+        elif stage == "variant_selection":
+            response = await self._order_variant_selection(platform, sender_id, user_id, text, history, extracted)
+
+        elif stage == "customer_info":
+            response = await self._order_customer_info(platform, sender_id, user_id, text, history, extracted)
+
+        elif stage == "confirmation":
+            response = await self._order_confirmation(platform, sender_id, user_id, text, history, extracted)
+
+        else:
+            response = "Bir hata oluştu. Lütfen tekrar sipariş vermek istediğinizi belirtin."
+            self.order_service.cancel_session(platform, sender_id)
+
+        # Bot cevabını kaydet
+        if response:
+            self.conversation_service.save_message(
+                user_id=user_id, platform=platform, role="assistant",
+                content=response, intent="order_request"
+            )
+
+        return response
+
+    async def _order_product_selection(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Ürün seçimi aşaması."""
+        # Ürünü ara
+        search_query = self.llm_service.extract_product_query(text, conversation_history=history)
+        products = []
+        if search_query:
+            products = self.product_service.search_products(search_query, max_results=3)
+
+        if products and len(products) == 1:
+            # Tek ürün bulundu, ekle ve variant aşamasına geç
+            self.order_service.add_product(platform, sender_id, products[0])
+            self.order_service.update_stage(platform, sender_id, "variant_selection")
+        elif products:
+            # Birden fazla — LLM seçim yaptırsın
+            pass
+
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        product_info = self.llm_service._format_products_for_llm(products) if products else ""
+        msg = f"{text}\n\nBulunan ürünler:\n{product_info}" if product_info else text
+
+        session = self.order_service.get_session(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=msg,
+            stage=session.stage if session else "product_selection",
+            order_data=order_data,
+            conversation_history=history
+        )
+
+    async def _order_variant_selection(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Beden/renk seçimi aşaması."""
+        variant = extracted.get("variant")
+        if variant:
+            # Varyant seçildi — kaydet ve customer_info aşamasına geç
+            session = self.order_service.get_session(platform, sender_id)
+            if session and session.items:
+                self.order_service.set_variant(platform, sender_id, len(session.items) - 1, variant)
+            self.order_service.update_stage(platform, sender_id, "customer_info")
+
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        session = self.order_service.get_session(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=text,
+            stage=session.stage if session else "variant_selection",
+            order_data=order_data,
+            conversation_history=history
+        )
+
+    async def _order_customer_info(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Müşteri bilgileri toplama aşaması."""
+        # Çıkarılan bilgileri kaydet
+        info_update = {}
+        if extracted.get("name"): info_update["name"] = extracted["name"]
+        if extracted.get("phone"): info_update["phone"] = extracted["phone"]
+        if extracted.get("address"): info_update["address"] = extracted["address"]
+
+        if info_update:
+            self.order_service.set_customer_info(platform, sender_id, info_update)
+
+        # Tüm bilgiler tamam mı kontrol et
+        session = self.order_service.get_session(platform, sender_id)
+        info = session.customer_info if session else {}
+
+        if info.get("name") and info.get("phone") and info.get("address"):
+            # Tüm bilgiler tamam → confirmation aşamasına geç
+            self.order_service.update_stage(platform, sender_id, "confirmation")
+            # Sipariş özetini oluştur ve LLM'e ver
+            order_summary = self.order_service.build_order_summary(platform, sender_id)
+            order_data = self.order_service.get_order_data(platform, sender_id)
+            return self.llm_service.generate_order_flow_response(
+                user_message=f"{text}\n\n[SİSTEM: Tüm bilgiler tamam. Aşağıdaki sipariş özetini müşteriye göster ve onay iste:]\n{order_summary}",
+                stage="confirmation",
+                order_data=order_data,
+                conversation_history=history
+            )
+
+        # Eksik bilgiler var
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=text,
+            stage="customer_info",
+            order_data=order_data,
+            conversation_history=history
+        )
+
+    async def _order_confirmation(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Sipariş onay aşaması."""
+        # Değişiklik isteniyor mu?
+        if extracted.get("wants_change"):
+            change_field = extracted.get("change_field", "")
+            if change_field in ("address", "phone", "name"):
+                self.order_service.update_stage(platform, sender_id, "customer_info")
+            elif change_field in ("variant",):
+                self.order_service.update_stage(platform, sender_id, "variant_selection")
+            elif change_field in ("product",):
+                self.order_service.clear_products(platform, sender_id)
+                self.order_service.update_stage(platform, sender_id, "product_selection")
+            else:
+                self.order_service.update_stage(platform, sender_id, "customer_info")
+
+            # Değiştirmek istenen bilgiyi güncelle
+            info_update = {}
+            if extracted.get("name"): info_update["name"] = extracted["name"]
+            if extracted.get("phone"): info_update["phone"] = extracted["phone"]
+            if extracted.get("address"): info_update["address"] = extracted["address"]
+            if info_update:
+                self.order_service.set_customer_info(platform, sender_id, info_update)
+
+            if extracted.get("variant"):
+                session = self.order_service.get_session(platform, sender_id)
+                if session and session.items:
+                    self.order_service.set_variant(platform, sender_id, len(session.items) - 1, extracted["variant"])
+
+            order_data = self.order_service.get_order_data(platform, sender_id)
+            session = self.order_service.get_session(platform, sender_id)
+            return self.llm_service.generate_order_flow_response(
+                user_message=text,
+                stage=session.stage if session else "customer_info",
+                order_data=order_data,
+                conversation_history=history
+            )
+
+        # Onay geldi mi?
+        if extracted.get("confirms_order"):
+            order_id = self.order_service.complete_order(platform, sender_id)
+            if order_id:
+                response = (
+                    f"Siparişiniz başarıyla oluşturuldu! 🎉\n\n"
+                    f"Sipariş No: #{order_id}\n"
+                    f"Ödeme Yöntemi: Kapıda Ödeme\n\n"
+                    f"Siparişiniz en kısa sürede hazırlanıp kargoya verilecektir. "
+                    f"Teşekkür ederiz! 💕\n\n"
+                    f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
+                )
+                return response
+            else:
+                return "Sipariş oluşturulurken bir hata oluştu. Lütfen tekrar deneyin."
+
+        # Ne onay ne değişiklik — LLM'e sor
+        order_summary = self.order_service.build_order_summary(platform, sender_id)
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=f"{text}\n\n[Mevcut sipariş özeti:]\n{order_summary}",
+            stage="confirmation",
+            order_data=order_data,
+            conversation_history=history
+        )
 
     # ══════════════════════════════════════════
     #  YARDIMCI METOTLAR
@@ -518,3 +815,62 @@ class ChatBot:
             conn.close()
         except Exception as e:
             print(f"[ChatBot] Intent guncelleme hatasi: {e}")
+
+    # ══════════════════════════════════════════
+    #  ADMIN TAKEOVER (Yönetici Devralma)
+    # ══════════════════════════════════════════
+
+    def activate_admin_takeover(self, platform: str, customer_sender_id: str):
+        """
+        Yönetici bir müşteriye mesaj attığında çağrılır.
+        Bot, bu müşteri için ADMIN_TAKEOVER_TIMEOUT süresince susturulur.
+        """
+        key = self._get_pending_key(platform, customer_sender_id)
+        now = datetime.utcnow()
+
+        if key in self._admin_takeover:
+            self._admin_takeover[key]["last_echo_at"] = now
+            print(f"[ChatBot] 🔄 Admin takeover yenilendi: {key}")
+        else:
+            self._admin_takeover[key] = {
+                "started_at": now,
+                "last_echo_at": now,
+            }
+            print(f"[ChatBot] 🛑 Admin takeover AKTIF: {key} ({ADMIN_TAKEOVER_TIMEOUT} dk)")
+
+        # Bekleyen görsel timer'ı da iptal et (admin cevap verecektir)
+        if key in self._pending_images:
+            self._pending_images.pop(key)["task"].cancel()
+            print(f"[ChatBot] Pending görsel timer iptal edildi (admin devralma): {key}")
+
+    def _is_admin_active(self, platform: str, sender_id: str) -> bool:
+        """
+        Bu müşteri için yönetici aktif mi kontrol eder.
+        Süre dolmuşsa otomatik olarak temizler.
+        """
+        key = self._get_pending_key(platform, sender_id)
+
+        if key not in self._admin_takeover:
+            return False
+
+        takeover = self._admin_takeover[key]
+        elapsed = (datetime.utcnow() - takeover["last_echo_at"]).total_seconds()
+        timeout_seconds = ADMIN_TAKEOVER_TIMEOUT * 60
+
+        if elapsed > timeout_seconds:
+            self._admin_takeover.pop(key, None)
+            print(f"[ChatBot] ✅ Admin takeover süresi doldu: {key} ({elapsed:.0f}s geçti)")
+            return False
+
+        remaining = timeout_seconds - elapsed
+        print(f"[ChatBot] ⏸️ Admin takeover aktif: {key} (kalan: {remaining:.0f}s)")
+        return True
+
+    def deactivate_admin_takeover(self, platform: str, sender_id: str):
+        """Manuel olarak admin takeover'ı kaldırır (opsiyonel endpoint için)."""
+        key = self._get_pending_key(platform, sender_id)
+        if key in self._admin_takeover:
+            self._admin_takeover.pop(key)
+            print(f"[ChatBot] ✅ Admin takeover kaldırıldı: {key}")
+            return True
+        return False

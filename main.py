@@ -73,19 +73,24 @@ async def lifespan(app: FastAPI):
 
 
 async def _periodic_sync():
-    """Arka planda periyodik ürün senkronizasyonu çalıştırır."""
-    # İlk sync'i hemen çalıştır (sunucu başlar başlamaz ürünler indexlensin)
+    """Arka planda periyodik ürün ve instagram senkronizasyonu çalıştırır."""
+    from services.instagram_sync import InstagramSync
+    ig_sync_service = InstagramSync()
+    
+    # İlk sync'i hemen çalıştır
     while True:
         try:
             stats = await sync_service.sync()
             if not stats.get("skipped"):
                 count = sync_service.get_product_count()
                 print(f"[Sync] Aktif ürün: {count}")
+                
+            # Instagram postlarını senkronize et (thread blocklamamak için thread ekleyebiliriz ama sync() blocking. asyncio.to_thread kullanalım)
+            await asyncio.to_thread(ig_sync_service.sync)
         except Exception as e:
             print(f"[Sync] Periyodik sync hatası: {e}")
 
         await asyncio.sleep(SYNC_INTERVAL * 60)
-
 
 # ═══════════════════════════════════════════
 #  FASTAPI UYGULAMASI
@@ -165,7 +170,13 @@ async def receive_webhook(request: Request):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
                     if value.get("statuses"):
-                        print("[INFO] Status bildirimi, atlaniyor.")
+                        # WhatsApp status bildirimi — yöneticinin gönderdiği mesajın durumu
+                        for status in value.get("statuses", []):
+                            if status.get("status") == "sent":
+                                recipient = status.get("recipient_id", "")
+                                if recipient:
+                                    chatbot.activate_admin_takeover("whatsapp", recipient)
+                                    print(f"[INFO] WA Admin takeover tetiklendi: {recipient}")
                         continue
                     if value.get("messages"):
                         print("[INFO] WhatsApp mesaji isleniyor...")
@@ -192,10 +203,16 @@ async def receive_webhook(request: Request):
                     print("[INFO] Instagram event (mesaj degil), atlaniyor.")
                     continue
 
-                # Echo check
+                # Echo check — Yöneticinin gönderdiği mesajlar
                 is_echo = msg_event.get("message", {}).get("is_echo", False)
                 if is_echo:
-                    print("[INFO] Instagram echo mesaji, atlaniyor.")
+                    # Bu mesajı gönderen yönetici, alıcı müşteri
+                    customer_id = msg_event.get("recipient", {}).get("id", "")
+                    if customer_id:
+                        chatbot.activate_admin_takeover("instagram", customer_id)
+                        print(f"[INFO] IG Admin takeover tetiklendi: {customer_id}")
+                    else:
+                        print("[INFO] IG echo: recipient ID bulunamadı.")
                     continue
 
                 print("[INFO] Instagram mesaji isleniyor...")
@@ -254,7 +271,8 @@ async def test_chat(request: Request):
         response = await chatbot._process_text_only(
             platform="web",
             user_id=user_id,
-            user_message=message
+            user_message=message,
+            sender_id=user_id_str
         )
 
         return {
