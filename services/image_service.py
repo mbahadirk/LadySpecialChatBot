@@ -98,13 +98,40 @@ class ImageService:
         filename = f"{int(time.time() * 1000)}.jpg"
         filepath = os.path.join(user_dir, filename)
 
+        try:
+            # Gelen veriyi normal görsel olarak açmayı dene
+            image = Image.open(BytesIO(image_bytes))
+        except Exception:
+            # Görsel açılamadıysa video olabilir (Reel vb). OpenCV ile ilk kareyi yakala
+            print(f"[ImageService] PIL ile açılamadı, video (MP4) olarak değerlendirip ilk kareyi yakalıyorum...")
+            import cv2
+            import numpy as np
+            temp_vid_path = os.path.join(user_dir, f"temp_{int(time.time() * 1000)}.mp4")
+            with open(temp_vid_path, "wb") as f:
+                f.write(image_bytes)
+            
+            cap = cv2.VideoCapture(temp_vid_path)
+            ret, frame = cap.read()
+            cap.release()
+            
+            # Geçici video dosyasını temizle
+            try:
+                os.remove(temp_vid_path)
+            except:
+                pass
+                
+            if ret:
+                # BGR'den RGB'ye çevirip PIL formatına getir
+                image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:
+                raise ValueError("Bilinmeyen veya okunamayan dosya formati (Ne görsel ne de geçerli bir video)")
+
         # JPEG olarak kaydet
-        image = Image.open(BytesIO(image_bytes))
         if image.mode != "RGB":
             image = image.convert("RGB")
         image.save(filepath, "JPEG", quality=85)
 
-        print(f"[ImageService] Gorsel kaydedildi: {filepath}")
+        print(f"[ImageService] Gorsel (veya videonun ilk karesi) kaydedildi: {filepath}")
         return filepath
 
     # ──────────────────────────────────────

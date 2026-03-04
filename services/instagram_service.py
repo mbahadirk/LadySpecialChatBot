@@ -209,23 +209,34 @@ class InstagramService:
                 # Attachment kontrolü
                 attachments = message.get("attachments", [])
                 media_url = None
+                ig_post_media_id = None
                 msg_type = "text"
 
                 if attachments:
                     for att in attachments:
                         att_type = att.get("type", "")
-                        payload_url = att.get("payload", {}).get("url")
+                        payload = att.get("payload", {})
+                        payload_url = payload.get("url")
+                        ig_mid = payload.get("ig_post_media_id") or payload.get("reel_video_id")
                         
-                        if att_type in ("image", "ig_post"):
+                        if ig_mid:
+                            ig_post_media_id = ig_mid
+                            
+                        # Eğer reel ise başlığı (caption'ı) direkt payload içinde veriyor!
+                        title = payload.get("title", "")
+                        if title and title not in text:
+                            text = f"{text}\n\n{title}".strip()
+                            
+                        if att_type == "image":
                             msg_type = "share" if msg_type == "share" else "image"
                             media_url = payload_url
-                        elif att_type == "video":
-                            msg_type = "share" if msg_type == "share" else "video"
+                        elif att_type in ("video", "ig_post", "ig_reel", "share"):
+                            msg_type = "share"
                             if not media_url:
                                 media_url = payload_url
-                        elif att_type == "share":
-                            msg_type = "share"
-                            if payload_url and "instagram.com" in payload_url and payload_url not in text:
+                            
+                            # Eğer type=share ise ve insta url'si payload'da varsa ekstra text olarak ekle
+                            if att_type == "share" and payload_url and "instagram.com" in payload_url and payload_url not in text:
                                 text = f"{text} {payload_url}".strip()
 
                 reply_to = message.get("reply_to", {})
@@ -236,6 +247,7 @@ class InstagramService:
                     "type": msg_type,
                     "text": text,
                     "media_url": media_url,
+                    "ig_post_media_id": ig_post_media_id,
                     "message_id": msg_id,
                     "reply_to_mid": reply_to_mid,
                 }

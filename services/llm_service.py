@@ -437,7 +437,12 @@ class LLMService:
         for p in results:
             stock_count = p.get('stock', 0)
             if p.get("in_stock"):
-                 stock_status = "STOKTA VAR" if stock_count > 10 else f"STOKTA ({stock_count} adet)"
+                 if stock_count >= 10:
+                     stock_status = "STOKTA VAR"
+                 elif stock_count > 0:
+                     stock_status = "STOKTA AMA AZ KALDI (Ürün elimizde mevcut fakat stoğu tükeniyor)"
+                 else:
+                     stock_status = "TUKENMIS"
             else:
                  stock_status = "TUKENMIS"
             line = f"{p['name']} -- {p.get('price', 0)} TL -- {stock_status}"
@@ -455,10 +460,10 @@ class LLMService:
         lines = []
         for p in products:
             stock_count = p.get('stock', 0)
-            if stock_count > 10:
+            if stock_count >= 10:
                 stock_status = "Stokta var"
             elif stock_count > 0:
-                stock_status = f"Stok: {stock_count} adet"
+                stock_status = "Stokta var ama stoğu tükeniyor"
             else:
                 stock_status = "Stokta yok"
             variants_info = ""

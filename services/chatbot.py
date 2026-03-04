@@ -22,6 +22,7 @@ import httpx
 
 from dotenv import load_dotenv
 
+from models.database import get_connection
 from services.user_service import UserService
 from services.conversation_service import ConversationService
 from services.product_service import ProductService
@@ -59,6 +60,10 @@ class ChatBot:
         # Bekleyen görseller (in-memory, hız için)
         # {platform_sender_id: {"image_path": str, "task": asyncio.Task, "user_id": int, "platform": str}}
         self._pending_images: dict = {}
+
+        # Bekleyen paylaşımlar (share/reel) — kullanıcı mesajını beklemek için
+        # {platform_sender_id: {"parsed": dict, "task": asyncio.Task, "user_id": int}}
+        self._pending_shares: dict = {}
 
         # Admin takeover: Yönetici bir müşteriyle konuşurken bot'u sustur
         # {platform_sender_id: {"started_at": datetime, "last_echo_at": datetime}}
@@ -147,13 +152,11 @@ class ChatBot:
         if msg_type == "image":
             return await self._handle_ig_image(sender_id, user_id, parsed)
         elif msg_type == "share":
-            # Share mesajlarında Meta bir önizleme görseli (media_url) sunar. 
-            # Varsa bunu görsel tabanlı ürün araması olarak değerlendir.
-            if parsed.get("media_url"):
-                return await self._handle_ig_image(sender_id, user_id, parsed)
-            else:
-                # Eğer görsel yoksa, normal metin olarak link ayıklamaya gönder
-                return await self._handle_text_message("instagram", sender_id, user_id, parsed)
+            # Share/Reel paylaşımlarında kullanıcı genellikle hemen ardından bir mesaj yazar ("fiyat nedir?" gibi).
+            # Tıpkı görsel mekanizmasında olduğu gibi, 5 saniye bekleyip mesajı birleştiriyoruz.
+            print(f"[ChatBot] Share/Reel alındı. Kullanıcı mesajı beklemek için 3s bekleniyor...")
+            self._set_pending_share("instagram", sender_id, user_id, parsed)
+            return None
         elif msg_type == "text" and parsed.get("text"):
             return await self._handle_text_message("instagram", sender_id, user_id, parsed)
         else:
@@ -288,7 +291,57 @@ class ChatBot:
             "user_id": user_id,
             "platform": platform,
         }
-        print(f"[ChatBot] Pending eklendi: {key} -> {image_path}")
+        print(f"[ChatBot] Pending görsel eklendi: {key} -> {image_path}")
+
+    # ══════════════════════════════════════════
+    #  PENDING SHARE MEKANIZMASI
+    # ══════════════════════════════════════════
+
+    SHARE_WAIT_TIMEOUT = 3  # saniye
+
+    def _set_pending_share(self, platform: str, sender_id: str, user_id: int, parsed: dict):
+        """Bekleyen paylaşım kaydı oluşturur ve timer başlatır."""
+        key = self._get_pending_key(platform, sender_id)
+
+        # Önceki bekleyen varsa iptal et
+        if key in self._pending_shares:
+            old = self._pending_shares[key]
+            old["task"].cancel()
+            print(f"[ChatBot] Önceki bekleyen share iptal edildi: {key}")
+
+        task = asyncio.create_task(
+            self._auto_process_share_timer(platform, sender_id, user_id, parsed)
+        )
+        self._pending_shares[key] = {
+            "parsed": parsed,
+            "task": task,
+            "user_id": user_id,
+        }
+        print(f"[ChatBot] Pending share eklendi: {key}")
+
+    async def _auto_process_share_timer(self, platform: str, sender_id: str, user_id: int, parsed: dict):
+        """SHARE_WAIT_TIMEOUT saniye sonra paylaşımı otomatik işler (kullanıcı mesaj yazmadıysa)."""
+        key = self._get_pending_key(platform, sender_id)
+
+        try:
+            await asyncio.sleep(self.SHARE_WAIT_TIMEOUT)
+
+            # Timer doldu, kullanıcıdan mesaj gelmedi — paylaşımı tek başına işle
+            if key not in self._pending_shares:
+                print(f"[ChatBot] Share timer: Paylaşım zaten işlenmiş: {key}")
+                return
+
+            self._pending_shares.pop(key, None)
+            print(f"[ChatBot] {self.SHARE_WAIT_TIMEOUT}s doldu, share tek başına işleniyor: {key}")
+
+            response = await self._handle_text_message(platform, sender_id, user_id, parsed)
+            # _handle_text_message zaten gerektiğinde mesajı gönderir
+
+        except asyncio.CancelledError:
+            print(f"[ChatBot] Share timer iptal edildi (mesaj geldi): {key}")
+
+        finally:
+            self._pending_shares.pop(key, None)
 
     async def _auto_process_image_timer(self, platform: str, sender_id: str, user_id: int, image_path: str):
         """IMAGE_WAIT_TIMEOUT saniye sonra görseli otomatik işler."""
@@ -352,16 +405,25 @@ class ChatBot:
 
         # 1. LİNK KONTROLÜ (Ürün linki gönderildiyse görselini çek ve arat)
         url_match = re.search(r'(https?://[^\s]+)', text)
-        if url_match:
-            extracted_url = url_match.group(1)
-            print(f"[ChatBot] Mesajda link bulundu: {extracted_url}")
-            
+        ig_post_media_id = parsed.get("ig_post_media_id")
+        
+        if url_match or ig_post_media_id:
+            extracted_url = url_match.group(1) if url_match else None
+            ig_match = None
+            if extracted_url:
+                print(f"[ChatBot] Mesajda link bulundu: {extracted_url}")
+                ig_match = re.search(r'instagram\.com/(?:p|reel|reels)/([^/?]+)', extracted_url)
+
             # Instagram Linki kontrolü
-            ig_match = re.search(r'instagram\.com/(?:p|reel)/([^/?]+)', extracted_url)
-            if ig_match:
-                shortcode = ig_match.group(1)
+            if ig_match or ig_post_media_id:
                 conn = get_connection()
-                row = conn.execute("SELECT caption, media_url FROM instagram_posts WHERE shortcode = ?", (shortcode,)).fetchone()
+                row = None
+                if ig_match:
+                    shortcode = ig_match.group(1)
+                    row = conn.execute("SELECT caption, media_url FROM instagram_posts WHERE shortcode = ?", (shortcode,)).fetchone()
+                elif ig_post_media_id:
+                    print(f"[ChatBot] Instagram Share (Media ID: {ig_post_media_id}) DB'de aranıyor...")
+                    row = conn.execute("SELECT caption, media_url FROM instagram_posts WHERE id = ?", (ig_post_media_id,)).fetchone()
                 conn.close()
                 if row and row["caption"]:
                     caption = row["caption"]
@@ -404,30 +466,77 @@ class ChatBot:
                             print(f"[ChatBot] IG post görseli indirme hatası: {e}")
                             
             # (Fallback: diğer linklerin og:image arama mantığı)
-            try:
-                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                    resp = await client.get(extracted_url)
-                    if resp.status_code == 200:
-                        # og:image (Açık Grafik Görseli) ara
-                        og_match = re.search(r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+?)["\']', resp.text, re.IGNORECASE)
-                        if og_match:
-                            img_url = og_match.group(1)
-                            print(f"[ChatBot] Linkten görsel bulundu: {img_url}")
+            if extracted_url:
+                try:
+                    # Instagram botlara karşı agresif bloklar uygulayabildiği için özel User-Agent veriyoruz
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+                    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+                        resp = await client.get(extracted_url)
+                        if resp.status_code == 200:
+                            import html
+                            # 1. Aşama: Sayfa meta açıklamasında SKU/Kod ara
+                            og_desc_match = re.search(r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']+?)["\']', resp.text, re.IGNORECASE)
+                            og_title_match = re.search(r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+?)["\']', resp.text, re.IGNORECASE)
                             
-                            # Görseli indir
-                            img_resp = await client.get(img_url)
-                            if img_resp.status_code == 200:
-                                image_path = self.image_service.save_image(user_id, img_resp.content)
-                                print(f"[ChatBot] Link görseli kaydedildi, modelden geçiriliyor: {image_path}")
-                                
-                                # Görsel ve metni birlikte işleyerek cevap ver
-                                response = await self._process_image_with_text(user_id, image_path, text, base_platform=platform, message_id=msg_id)
-                                if response:
-                                    await self._send_message(platform, sender_id, response)
-                                return response
-            except Exception as e:
-                print(f"[ChatBot] Link işleme hatası: {e}")
-                # Hata olursa kırılma, normal metin işlemeye devam et
+                            meta_text = ""
+                            if og_desc_match: meta_text += html.unescape(og_desc_match.group(1)) + " "
+                            if og_title_match: meta_text += html.unescape(og_title_match.group(1))
+                            
+                            if meta_text.strip():
+                                found_skus = self.product_service.extract_skus_from_text(meta_text)
+                                if found_skus:
+                                    products = self.product_service.get_products_by_skus(found_skus)
+                                    if products:
+                                        print(f"[ChatBot] Link metasından (og:description) ürünler bulundu: {found_skus}")
+                                        history = self.conversation_service.get_conversation_history(user_id)
+                                        response = self.llm_service.generate_instagram_link_response(
+                                            user_message=text,
+                                            search_results=products,
+                                            conversation_history=history
+                                        )
+                                        self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                                        self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                                        if response:
+                                            await self._send_message(platform, sender_id, response)
+                                        return response
+    
+                            # 3. Aşama: Paylaşımdan gelen bir media_url de yoksa, web sayfasının kendi görselini (og:image) kullan
+                            og_match = re.search(r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+?)["\']', resp.text, re.IGNORECASE)
+                            if og_match:
+                                img_url = html.unescape(og_match.group(1))
+                                # Instagram "Giriş Yap" logosunu yakalamasını engelle
+                                if "cdninstagram.com" not in img_url and "rsrc.php" not in img_url:
+                                    print(f"[ChatBot] Linkten görsel bulundu: {img_url}")
+                                    
+                                    # Görseli indir
+                                    img_resp = await client.get(img_url)
+                                    if img_resp.status_code == 200:
+                                        image_path = self.image_service.save_image(user_id, img_resp.content)
+                                        print(f"[ChatBot] Link görseli kaydedildi, modelden geçiriliyor: {image_path}")
+                                        
+                                        # Görsel ve metni birlikte işleyerek cevap ver
+                                        response = await self._process_image_with_text(user_id, image_path, text, base_platform=platform, message_id=msg_id)
+                                        if response:
+                                            await self._send_message(platform, sender_id, response)
+                                        return response
+                except Exception as e:
+                    print(f"[ChatBot] Link işleme hatası: {e}")
+                    # Hata olursa kırılma, normal metin işlemeye devam et
+                    
+            # 4. Aşama: Eğer hiçbir metin veya link eşleşmesi işe yaramadıysa, güvenilir Webhook media_url (video ilk karesi / fotoğraf) üzerinden vektör aramasına yönel
+            webhook_media = parsed.get("media_url")
+            
+            # Fakat son bir kontrol daha: Webhook title (veya eklenen metin) içinde bir Kod (SKU) varsa, görsel aramasına İHTİYAÇ YOKTUR!
+            found_skus_in_text = self.product_service.extract_skus_from_text(text) if text else []
+            
+            if webhook_media and not found_skus_in_text:
+                print(f"[ChatBot] Paylaşımdaki metin araması sonuç vermedi. Güvenilir Webhook media_url üzerinden görsel/video tespiti deneniyor...")
+                # ig_image bunu otomatik olarak ele alabiliyor
+                return await self._handle_ig_image(sender_id, user_id, parsed)
+            elif webhook_media and found_skus_in_text:
+                print(f"[ChatBot] 🎯 Harika! Paylaşılan Reels/Post webhook 'title' verisinde SKU bulundu: {found_skus_in_text}. Görsel aramaya gerek yok, normal metin gibi işlenecek.")
+                # Pass, natural flow will take over in `_process_text_only`
+                pass
 
         # 0. SİPARİŞ OTURUMU KONTROLÜ (link kontrolünden SONRA)
         # Aktif sipariş oturumu varsa mesajı sipariş akışına yönlendir
@@ -439,11 +548,90 @@ class ChatBot:
                 await self._send_message(platform, sender_id, response)
             return response
 
+        # 1.5 PENDING SHARE KONTROLÜ
+        # Kullanıcı bir Reel/Post paylaştıktan sonra hemen ardından mesaj yazdıysa,
+        # paylaşım metni ile kullanıcı mesajını birleştirip tek seferde işliyoruz.
+        share_combined = False
+        if key in self._pending_shares:
+            share_data = self._pending_shares.pop(key)
+            share_data["task"].cancel()
+            share_parsed = share_data["parsed"]
+            share_text = share_parsed.get("text", "")
+
+            # Kullanıcı metnini share metnine ekle
+            combined_text = f"{share_text}\n\nKullanıcı mesajı: {text}".strip()
+            text = combined_text
+            parsed["text"] = combined_text
+
+            # Share'den gelen media_url ve ig_post_media_id'yi taşı
+            if share_parsed.get("media_url"):
+                parsed["media_url"] = share_parsed["media_url"]
+            if share_parsed.get("ig_post_media_id"):
+                parsed["ig_post_media_id"] = share_parsed["ig_post_media_id"]
+
+            share_combined = True
+            print(f"[ChatBot] ✅ Bekleyen share ile kullanıcı mesajı birleştirildi!")
+            print(f"[ChatBot] Birleşik metin: '{text[:100]}...'")
+
+            # Share birleştirildiğinde SKU kontrolü yap — varsa direkt ürün cevabı ver
+            found_skus = self.product_service.extract_skus_from_text(text)
+            if found_skus:
+                products = self.product_service.get_products_by_skus(found_skus)
+                if products:
+                    print(f"[ChatBot] 🎯 Share+metin birleşmesinden SKU bulundu: {found_skus}")
+                    history = self.conversation_service.get_conversation_history(user_id)
+                    response = self.llm_service.generate_instagram_link_response(
+                        user_message=text,
+                        search_results=products,
+                        conversation_history=history
+                    )
+                    self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                    self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                    if response:
+                        await self._send_message(platform, sender_id, response)
+                    return response
+
+            # SKU bulunamadı — DB'den ig_post_media_id ile caption'ı çekmeyi dene
+            share_ig_id = parsed.get("ig_post_media_id")
+            if share_ig_id and not found_skus:
+                try:
+                    conn = get_connection()
+                    row = conn.execute("SELECT caption FROM instagram_posts WHERE id = ?", (share_ig_id,)).fetchone()
+                    conn.close()
+                    if row and row["caption"]:
+                        caption_skus = self.product_service.extract_skus_from_text(row["caption"])
+                        if caption_skus:
+                            products = self.product_service.get_products_by_skus(caption_skus)
+                            if products:
+                                print(f"[ChatBot] 🎯 Share DB caption'dan SKU bulundu: {caption_skus}")
+                                combined_for_llm = f"{row['caption']}\n\nKullanıcı mesajı: {text}"
+                                history = self.conversation_service.get_conversation_history(user_id)
+                                response = self.llm_service.generate_instagram_link_response(
+                                    user_message=combined_for_llm,
+                                    search_results=products,
+                                    conversation_history=history
+                                )
+                                self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                                self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                                if response:
+                                    await self._send_message(platform, sender_id, response)
+                                return response
+                except Exception as e:
+                    print(f"[ChatBot] Share DB caption arama hatası: {e}")
+
+            # Hâlâ SKU bulunamadı — media_url varsa görsel aramasına yönel
+            share_media = parsed.get("media_url")
+            if share_media:
+                print(f"[ChatBot] Share+metin birleşmesinde SKU bulunamadı, görsel aranıyor...")
+                return await self._handle_ig_image(sender_id, user_id, parsed)
+
         # 2. RACE CONDITION (ÇİFT MESAJ) KORUMASI
         # Kullanıcılar "önce metin, sonra görsel" atarsa, iki ayrı bildirim gelir.
         # Metne "Anlamadım" cevabı gitmemesi için 4 saniye görsel gelmesini bekliyoruz.
-        print(f"[ChatBot] '{text}' alındı. Görsel gelme ihtimaline karşı 4s bekleniyor...")
-        await asyncio.sleep(4)
+        # (Share birleşmesinde bu beklemeye gerek yok çünkü zaten 3s bekledik)
+        if not share_combined:
+            print(f"[ChatBot] '{text[:80]}' alındı. Görsel/share gelme ihtimaline karşı 3s bekleniyor...")
+            await asyncio.sleep(3)
 
         # 3. In-memory dict kontrolü (Bekleyen görsel var mı?)
         pending_image = None
@@ -453,7 +641,78 @@ class ChatBot:
             pending_image = pending["image_path"]
             print(f"[ChatBot] Dict'ten bekleyen gorsel bulundu: {pending_image}")
 
-        # 2. DB fallback kontrolü
+        # 3b. Bekleyen share kontrolü (3s bekleme sırasında share gelmiş olabilir)
+        if not pending_image and key in self._pending_shares:
+            share_data = self._pending_shares.pop(key)
+            share_data["task"].cancel()
+            share_parsed = share_data["parsed"]
+            share_text = share_parsed.get("text", "")
+
+            # Kullanıcı metnini share metnine ekle
+            combined_text = f"{share_text}\n\nKullanıcı mesajı: {text}".strip()
+            text = combined_text
+            parsed["text"] = combined_text
+
+            if share_parsed.get("media_url"):
+                parsed["media_url"] = share_parsed["media_url"]
+            if share_parsed.get("ig_post_media_id"):
+                parsed["ig_post_media_id"] = share_parsed["ig_post_media_id"]
+
+            print(f"[ChatBot] ✅ 3s bekleme sırasında share geldi, birleştirildi!")
+
+            # SKU kontrolü
+            found_skus = self.product_service.extract_skus_from_text(text)
+            if found_skus:
+                products = self.product_service.get_products_by_skus(found_skus)
+                if products:
+                    print(f"[ChatBot] 🎯 Metin+Share birleşmesinden SKU bulundu: {found_skus}")
+                    history = self.conversation_service.get_conversation_history(user_id)
+                    response = self.llm_service.generate_instagram_link_response(
+                        user_message=text,
+                        search_results=products,
+                        conversation_history=history
+                    )
+                    self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                    self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                    if response:
+                        await self._send_message(platform, sender_id, response)
+                    return response
+
+            # SKU bulunamadı — DB'den ig_post_media_id ile caption ara
+            post_share_ig_id = parsed.get("ig_post_media_id")
+            if post_share_ig_id and not found_skus:
+                try:
+                    conn = get_connection()
+                    row = conn.execute("SELECT caption FROM instagram_posts WHERE id = ?", (post_share_ig_id,)).fetchone()
+                    conn.close()
+                    if row and row["caption"]:
+                        caption_skus = self.product_service.extract_skus_from_text(row["caption"])
+                        if caption_skus:
+                            products = self.product_service.get_products_by_skus(caption_skus)
+                            if products:
+                                print(f"[ChatBot] 🎯 3s-wait Share DB caption'dan SKU bulundu: {caption_skus}")
+                                combined_for_llm = f"{row['caption']}\n\nKullanıcı mesajı: {text}"
+                                history = self.conversation_service.get_conversation_history(user_id)
+                                response = self.llm_service.generate_instagram_link_response(
+                                    user_message=combined_for_llm,
+                                    search_results=products,
+                                    conversation_history=history
+                                )
+                                self.conversation_service.save_message(user_id=user_id, platform=platform, role="user", content=text, message_id=msg_id)
+                                self.conversation_service.save_message(user_id=user_id, platform=platform, role="assistant", content=response, intent="product_inquiry")
+                                if response:
+                                    await self._send_message(platform, sender_id, response)
+                                return response
+                except Exception as e:
+                    print(f"[ChatBot] 3s-wait Share DB caption arama hatası: {e}")
+
+            # Hâlâ SKU bulunamadı — media_url varsa görsel aramasına yönel
+            share_media_url = parsed.get("media_url")
+            if share_media_url:
+                print(f"[ChatBot] 3s-wait Metin+Share'de SKU bulunamadı, görsel aranıyor...")
+                return await self._handle_ig_image(sender_id, user_id, parsed)
+
+        # DB fallback kontrolü
         if not pending_image:
             pending_image = self.conversation_service.get_unprocessed_recent_image(
                 user_id, max_age_seconds=IMAGE_WAIT_TIMEOUT + 5

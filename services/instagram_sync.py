@@ -34,11 +34,23 @@ class InstagramSync:
                 for item in data.get("data", []):
                     # Extract shortcode from permalink (e.g. https://www.instagram.com/p/DF2u1b1R1Xv/)
                     permalink = item.get("permalink", "")
+                    from urllib.parse import urlparse
                     shortcode = ""
-                    if "/p/" in permalink:
-                        shortcode = permalink.split("/p/")[-1].strip("/")
-                    elif "/reel/" in permalink:
-                        shortcode = permalink.split("/reel/")[-1].strip("/")
+                    parsed_url = urlparse(permalink)
+                    path_parts = [p for p in parsed_url.path.split('/') if p]
+                    
+                    if "p" in path_parts:
+                        idx = path_parts.index("p")
+                        if len(path_parts) > idx + 1:
+                            shortcode = path_parts[idx + 1]
+                    elif "reel" in path_parts:
+                        idx = path_parts.index("reel")
+                        if len(path_parts) > idx + 1:
+                            shortcode = path_parts[idx + 1]
+                    elif "reels" in path_parts:
+                        idx = path_parts.index("reels")
+                        if len(path_parts) > idx + 1:
+                            shortcode = path_parts[idx + 1]
                         
                     if not shortcode:
                         continue
