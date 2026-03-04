@@ -118,6 +118,7 @@ def init_db():
             platform        TEXT NOT NULL,
             customer_name   TEXT,
             customer_phone  TEXT,
+            customer_email  TEXT,
             customer_address TEXT,
             total_price     REAL DEFAULT 0,
             shipping_cost   REAL DEFAULT 0,
@@ -159,6 +160,12 @@ def init_db():
     try:
         cursor.execute("ALTER TABLE products ADD COLUMN skus TEXT")
         print("[DB] skus kolonu eklendi (migration).")
+    except Exception:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE orders ADD COLUMN customer_email TEXT")
+        print("[DB] customer_email kolonu eklendi (migration).")
     except Exception:
         pass
 

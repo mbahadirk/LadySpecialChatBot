@@ -69,7 +69,7 @@ class ConversationService:
 
         # En son mesajları al (ters sırayla sorgula, sonra düzelt)
         cursor.execute(
-            """SELECT role, content, image_path FROM messages
+            """SELECT role, content, image_path, intent FROM messages
                WHERE user_id = ?
                ORDER BY created_at DESC
                LIMIT ?""",
@@ -90,7 +90,11 @@ class ConversationService:
                 elif not content or content.strip() == "":
                     content = "[Musteri bir urun gorseli gonderdi]"
 
-            messages.append({"role": row["role"], "content": content})
+            messages.append({
+                "role": row["role"], 
+                "content": content,
+                "intent": row["intent"]
+            })
 
         return messages
 

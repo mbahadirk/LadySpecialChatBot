@@ -21,6 +21,7 @@ class PromptManager:
     ORDER_RESPONSE = "order_response_prompt.txt"
     GREETING_RESPONSE = "greeting_response_prompt.txt"
     ORDER_FLOW_PROMPT = "order_flow_prompt.txt"
+    ORDER_TRACKING_PROMPT = "order_tracking_prompt.txt"
 
     _cache: dict[str, str] = {}
 
@@ -82,6 +83,11 @@ class PromptManager:
     def get_order_flow_prompt(cls) -> str:
         """Sipariş akışı promptunu döndürür."""
         return cls.load_prompt(cls.ORDER_FLOW_PROMPT)
+
+    @classmethod
+    def get_order_tracking_prompt(cls) -> str:
+        """Sipariş takip promptunu döndürür."""
+        return cls.load_prompt(cls.ORDER_TRACKING_PROMPT)
 
     @classmethod
     def clear_cache(cls):

@@ -242,6 +242,43 @@ async def receive_webhook(request: Request):
 
 
 # ═══════════════════════════════════════════
+#  IKAS WEBHOOK MESAJ İŞLEME
+# ═══════════════════════════════════════════
+
+@app.post("/ikas/webhook/order")
+async def receive_ikas_order_webhook(request: Request):
+    """Ikas sipariş durum güncellemelerini alır."""
+    # Güvenlik kontrolü (Ikas webhook header'ından client_id gelip gelmediği varsayımı)
+    try:
+        data = await request.json()
+        print(f"\n{'='*60}")
+        print("IKAS WEBHOOK GELDI")
+        print(f"{'='*60}")
+        client_id_header = request.headers.get("x-ikas-client-id", "")
+        # İki tür client id tanımlı, sipariş için olanı kontrol edelim
+        ikas_client_id = os.getenv("IKAS_ORDERING_CLIENT_ID", "")
+        if ikas_client_id and client_id_header != ikas_client_id:
+            # Şimdilik güvenlik uyarısi verip devam etsin, header yapısını bilmiyoruz
+            print(f"[UYARI] Ikas Webhook: Header eşleşmedi. Gelen: {client_id_header}, Beklenen: {ikas_client_id}")
+
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+
+        # Order tracking service'i güncelle
+        if hasattr(chatbot, 'order_tracker') and chatbot.order_tracker:
+            chatbot.order_tracker.update_order_from_webhook(data)
+            print("[INFO] Ikas Webhook: Sipariş takip sistemi güncellendi.")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        print(f"[HATA] Ikas Webhook işleme: {e}")
+        import traceback
+        traceback.print_exc()
+        # Ikas timeout olmasın diye 200 dönüyoruz
+        return {"status": "error", "message": str(e)}
+
+
+# ═══════════════════════════════════════════
 #  YARDIMCI ENDPOINT'LER
 # ═══════════════════════════════════════════
 

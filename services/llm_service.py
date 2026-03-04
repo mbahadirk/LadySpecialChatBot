@@ -32,7 +32,7 @@ class LLMService:
         Müşterinin mesajının intent'ini (niyetini) belirler.
 
         Returns:
-            "product_inquiry" | "order_request" | "greeting" | "complaint" | "general_chat"
+            "product_inquiry" | "order_request" | "order_tracking" | "greeting" | "complaint" | "general_chat"
         """
         classification_prompt = PromptManager.get_intent_classification_prompt()
 
@@ -50,7 +50,7 @@ class LLMService:
 
             # Bilinen intent'lerden biri mi kontrol et
             valid_intents = [
-                "product_inquiry", "order_request",
+                "product_inquiry", "order_request", "order_tracking",
                 "greeting", "complaint", "general_chat"
             ]
             if intent not in valid_intents:
@@ -258,6 +258,7 @@ class LLMService:
             order_context += "\n\nMüşteri Bilgileri:\n"
             if info.get("name"): order_context += f"İsim: {info['name']}\n"
             if info.get("phone"): order_context += f"Telefon: {info['phone']}\n"
+            if info.get("email"): order_context += f"E-posta: {info['email']}\n"
             if info.get("address"): order_context += f"Adres: {info['address']}\n"
 
         messages = [
@@ -291,13 +292,15 @@ class LLMService:
                 "Çıkarılacak alanlar:\n"
                 "- name: İsim ve soyisim\n"
                 "- phone: Telefon numarası\n"
+                "- email: E-posta adresi\n"
                 "- address: Adres\n"
-                "- variant: Beden veya renk bilgisi (örn: 'M', 'S/Siyah', '38')\n"
+                "- variant: Beden veya renk bilgisi (örn: 'M', 'S/Siyah', '38'). Hem renk hem beden kesinlikle belirtilmelidir.\n"
                 "- payment_method: Ödeme yöntemi. Kapıda ödeme → 'kapida_odeme', Havale → 'havale', EFT → 'eft'. null ise belirlenmemiş\n"
                 "- wants_cancel: Müşteri siparişi iptal etmek istiyor mu? (true/false)\n"
                 "- confirms_order: Müşteri siparişi onaylıyor mu? (true/false)\n"
+                "- confirms_price: Müşteri fiyat özetini kabul ediyor mu / devam etmek istiyor mu? (true/false)\n"
                 "- wants_change: Müşteri siparişteki bir bilgiyi değiştirmek istiyor mu? (true/false)\n"
-                "- change_field: Değiştirmek istenen alan (address/phone/name/variant/product/payment veya null)\n\n"
+                "- change_field: Değiştirmek istenen alan (address/phone/email/name/variant/product/payment veya null)\n\n"
                 f"Mevcut sipariş aşaması: {stage}\n"
             )
 
@@ -468,8 +471,26 @@ class LLMService:
                 stock_status = "Stokta yok"
             variants_info = ""
             if p.get("in_stock_variants"):
-                variant_texts = [v.get("option1", "") for v in p["in_stock_variants"][:5]]
-                variants_info = f" | Seçenekler: {', '.join(variant_texts)}"
+                # Renk ve beden bilgilerini ayrı ayrı göster
+                sizes = set()
+                colors = set()
+                for v in p["in_stock_variants"]:
+                    if v.get("option1"):
+                        sizes.add(v["option1"])
+                    if v.get("option2"):
+                        colors.add(v["option2"])
+                
+                variant_parts = []
+                if sizes:
+                    variant_parts.append(f"Bedenler: {', '.join(sorted(sizes))}")
+                if colors:
+                    variant_parts.append(f"Renkler: {', '.join(sorted(colors))}")
+                if variant_parts:
+                    variants_info = f" | {' | '.join(variant_parts)}"
+                else:
+                    # Fallback: sadece option1 göster
+                    variant_texts = [v.get("option1", "") for v in p["in_stock_variants"][:5]]
+                    variants_info = f" | Seçenekler: {', '.join(variant_texts)}"
 
             url_line = f"\n   URL: {p.get('url', 'Yok')}" if stock_count > 0 else ""
 
@@ -479,6 +500,81 @@ class LLMService:
             )
 
         return "\n".join(lines)
+
+    # ══════════════════════════════════════════
+    #  SİPARİŞ TAKİP
+    # ══════════════════════════════════════════
+
+    def extract_tracking_info(self, user_message: str, conversation_history: list[dict] = None) -> dict:
+        """
+        Kullanıcı mesajından sipariş takip bilgilerini çıkarır.
+        (telefon, e-posta, sipariş numarası)
+        """
+        history_text = ""
+        if conversation_history:
+            recent = conversation_history[-6:]
+            for msg in recent:
+                role = "Müşteri" if msg.get("role") == "user" else "Asistan"
+                history_text += f"{role}: {msg.get('content', '')}\n"
+
+        prompt = f"""Kullanıcının mesajından sipariş takip için gerekli bilgileri çıkar.
+
+Çıkarılacak alanlar:
+- phone: Telefon numarası (varsa)
+- email: E-posta adresi (varsa)
+- order_number: Sipariş numarası (varsa, sadece bir sayı)
+- wants_tracking: Müşteri siparişini sorgulamak istiyor mu? (true/false)
+
+Geçmiş konuşma:
+{history_text}
+
+Müşteri mesajı: {user_message}
+
+SADECE JSON döndür, başka hiçbir şey yazma:
+{{"phone": "", "email": "", "order_number": "", "wants_tracking": true}}"""
+
+        messages = [
+            {"role": "system", "content": "Sipariş bilgisi çıkaran asistan. SADECE JSON döndür."},
+            {"role": "user", "content": prompt}
+        ]
+
+        raw = self._call_llm(messages, model="gpt-4o-mini")
+
+        import json
+        try:
+            # JSON bloğunu temizle
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1]
+                cleaned = cleaned.rsplit("```", 1)[0]
+            return json.loads(cleaned)
+        except Exception:
+            return {"phone": "", "email": "", "order_number": "", "wants_tracking": True}
+
+    def generate_order_tracking_response(
+        self, user_message: str, order_data: str,
+        conversation_history: list[dict] = None
+    ) -> str:
+        """Sipariş durumu hakkında doğal dilde cevap üretir."""
+        tracking_prompt = PromptManager.get_order_tracking_prompt()
+
+        history_messages = []
+        if conversation_history:
+            for msg in conversation_history[-6:]:
+                role = msg.get("role", "user")
+                if role not in ("user", "assistant"):
+                    role = "user"
+                history_messages.append({"role": role, "content": msg.get("content", "")})
+
+        system_content = f"{tracking_prompt}\n\n{order_data}"
+
+        messages = [
+            {"role": "system", "content": system_content},
+            *history_messages,
+            {"role": "user", "content": user_message}
+        ]
+
+        return self._call_llm(messages)
 
     def _call_llm(self, messages: list[dict], model: str = None) -> str:
         """OpenAI API'ye istek gönderir."""
@@ -494,4 +590,5 @@ class LLMService:
         except Exception as e:
             print(f"[LLM] Hata: {e}")
             return "Bir aksaklik yasandi, lutfen biraz sonra tekrar deneyin."
+
 

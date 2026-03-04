@@ -31,6 +31,7 @@ from services.whatsapp_service import WhatsAppService
 from services.instagram_service import InstagramService
 from services.image_service import ImageService
 from services.order_service import OrderService
+from services.order_tracking_service import OrderTrackingService
 
 load_dotenv()
 
@@ -51,6 +52,7 @@ class ChatBot:
         self.instagram_service = InstagramService()
         self.image_service = ImageService()
         self.order_service = OrderService()
+        self.order_tracking_service = OrderTrackingService()
 
         # Bot'un kendi gönderdiği mesajların zamanları (platform_sender_id -> timestamp)
         # Bu, bot echo'ları ile admin mesajlarını ayırmak için kullanılır
@@ -773,6 +775,29 @@ class ChatBot:
 
         intent = self.llm_service.classify_intent(user_message)
 
+        # Sipariş takip devam kontrolü:
+        # Müşteri son mesajda sipariş sorguluyordu ve şimdi bilgi veriyorsa
+        # (telefon, e-posta, sipariş no), intent'i order_tracking olarak devam ettir.
+        if history:
+            last_intent = None
+            for msg in reversed(history):
+                if msg.get("intent"):
+                    last_intent = msg["intent"]
+                    break
+            if last_intent == "order_tracking":
+                # Telefon, e-posta veya sipariş no gibi bir bilgi içeriyorsa devam et
+                import re
+                has_phone = bool(re.search(r'[\d\s\+\-\(\)]{7,}', user_message))
+                has_email = bool(re.search(r'[\w\.\-]+@[\w\.\-]+', user_message))
+                has_order_num = bool(re.search(r'\b\d{4,8}\b', user_message))  # Sipariş numarası genellikle 4-8 hane
+                
+                # Eğer sadece rakam gönderdiyse de sipariş no kabul et
+                only_digits = user_message.strip().isdigit()
+                
+                if has_phone or has_email or has_order_num or only_digits:
+                    intent = "order_tracking"
+                    print(f"[ChatBot] Sipariş takip devamı: intent override → order_tracking")
+
         response = await self._route_intent(
             intent=intent, user_message=user_message, user_id=user_id,
             history=history, is_returning=is_returning,
@@ -793,11 +818,14 @@ class ChatBot:
         platform: str = "", sender_id: str = ""
     ) -> str:
         """Intent'e göre ilgili handler'a yönlendirir."""
+        print(f"[ChatBot] 🎯 Intent: '{intent}' | Mesaj: '{user_message[:80]}'")
 
         if intent == "product_inquiry":
             return self._handle_product_inquiry(user_message, user_id, history)
         elif intent == "order_request":
             return self._handle_order_request(platform, sender_id, user_message, user_id, history)
+        elif intent == "order_tracking":
+            return await self._handle_order_tracking(platform, sender_id, user_message, user_id, history)
         elif intent == "greeting":
             return self.llm_service.generate_greeting_response(
                 user_message, is_returning, history
@@ -862,6 +890,86 @@ class ChatBot:
         return response
 
     # ══════════════════════════════════════════
+    #  SİPARİŞ TAKİP
+    # ══════════════════════════════════════════
+
+    async def _handle_order_tracking(self, platform: str, sender_id: str, user_message: str, user_id: int, history: list[dict]) -> str:
+        """
+        Sipariş takip akışı:
+        1. Chat'te oluşturulmuş sipariş var mı kontrol et
+        2. Yoksa kullanıcıdan bilgi iste veya verilen bilgiyle ara
+        3. Sonuçları LLM'e ilet, doğal dilde cevap ürettir
+        """
+        TRACKING_URL = "https://ladyspecial.com.tr/pages/order-tracking"
+        
+        # 1. Kullanıcının mesajından sipariş bilgisi çıkar
+        extracted = self.llm_service.extract_tracking_info(user_message, history)
+        phone = (extracted.get("phone") or "").strip()
+        email = (extracted.get("email") or "").strip()
+        order_number = (extracted.get("order_number") or "").strip()
+
+        orders = []
+
+        # 2. Sipariş numarası verilmişse direkt ara
+        if order_number:
+            order = self.order_tracking_service.find_order_by_number(order_number)
+            if order:
+                orders = [order]
+                print(f"[OrderTracking] Sipariş numarasıyla bulundu: #{order_number}")
+
+        # 3. Telefon verilmişse ara
+        if not orders and phone:
+            orders = self.order_tracking_service.find_orders_by_phone(phone)
+            print(f"[OrderTracking] Telefon ile {len(orders)} sipariş bulundu: {phone}")
+
+        # 4. E-posta ile arama devre dışı bırakıldı
+
+        # 5. Hiçbir bilgi verilmediyse — bu chat'te oluşturulmuş sipariş var mı bak
+        if not orders and not phone and not order_number:
+            local_orders = self.order_tracking_service.find_orders_by_user_id(user_id)
+            if local_orders:
+                orders = local_orders
+                print(f"[OrderTracking] Chat'te oluşturulmuş {len(orders)} sipariş bulundu.")
+
+        # 6. Sonuçlara göre cevap üret
+        if orders:
+            order_data = self.order_tracking_service.format_orders_summary(orders)
+            return self.llm_service.generate_order_tracking_response(
+                user_message=user_message,
+                order_data=order_data,
+                conversation_history=history
+            )
+
+        # 7. Hiçbir sonuç bulunamadı
+        if phone or email or order_number:
+            # Bilgi verildi ama sonuç yok — diğer yöntemleri öner
+            no_result_data = (
+                f"[SİSTEM: Müşteri aşağıdaki bilgilerle sipariş sorguladı ama hiçbir sonuç bulunamadı.\n"
+                f"Telefon: {phone or 'verilmedi'}\n"
+                f"Sipariş No: {order_number or 'verilmedi'}\n\n"
+                f"Müşteriye başka/farklı bir numara veya sipariş numarası ile tekrar denemesini teklif et. "
+                f"Eğer kontrol edebileceği bir link istersen {TRACKING_URL} adresini ver, ancak bunu vermek yerine sohbette çözmeye odaklan.]"
+            )
+            return self.llm_service.generate_order_tracking_response(
+                user_message=user_message,
+                order_data=no_result_data,
+                conversation_history=history
+            )
+
+        # 8. Hiç bilgi verilmedi, chat'te sipariş de yok — bilgi iste
+        ask_info_data = (
+            f"[SİSTEM: Müşteri siparişinin durumunu öğrenmek istiyor ama henüz KİMLİK BİLGİSİ VERMEDİ. \n"
+            f"Bu sohbette oluşturulmuş bir sipariş de bulunamadı.\n"
+            f"Müşteriden siparişini sorgulayabilmek için KESİNLİKLE VE SADECE telefon numarasını veya sipariş numarasını İSTE. \n"
+            f"Sakin ona sipariş izleme sitesinin linkini verme. Müşteri buradaki sohbet üzerinden sorgulama yapmalıdır.]"
+        )
+        return self.llm_service.generate_order_tracking_response(
+            user_message=user_message,
+            order_data=ask_info_data,
+            conversation_history=history
+        )
+
+    # ══════════════════════════════════════════
     #  SİPARİŞ AKIŞI (Order Flow)
     # ══════════════════════════════════════════
 
@@ -904,14 +1012,17 @@ class ChatBot:
         elif stage == "variant_selection":
             response = await self._order_variant_selection(platform, sender_id, user_id, text, history, extracted)
 
-        elif stage == "payment_selection":
-            response = await self._order_payment_selection(platform, sender_id, user_id, text, history, extracted)
+        elif stage == "price_summary":
+            response = await self._order_price_summary(platform, sender_id, user_id, text, history, extracted)
 
         elif stage == "customer_info":
             response = await self._order_customer_info(platform, sender_id, user_id, text, history, extracted)
 
         elif stage == "confirmation":
             response = await self._order_confirmation(platform, sender_id, user_id, text, history, extracted)
+
+        elif stage == "payment_selection":
+            response = await self._order_payment_selection(platform, sender_id, user_id, text, history, extracted)
 
         else:
             response = "Bir hata oluştu. Lütfen tekrar sipariş vermek istediğinizi belirtin."
@@ -958,11 +1069,21 @@ class ChatBot:
         """Beden/renk seçimi aşaması."""
         variant = extracted.get("variant")
         if variant:
-            # Varyant seçildi — kaydet ve payment_selection aşamasına geç
+            # Varyant seçildi — kaydet ve price_summary aşamasına geç
             session = self.order_service.get_session(platform, sender_id)
             if session and session.items:
                 self.order_service.set_variant(platform, sender_id, len(session.items) - 1, variant)
-            self.order_service.update_stage(platform, sender_id, "payment_selection")
+            self.order_service.update_stage(platform, sender_id, "price_summary")
+
+            # Fiyat özetini oluştur ve LLM'e ver
+            price_summary = self.order_service.build_price_summary(platform, sender_id)
+            order_data = self.order_service.get_order_data(platform, sender_id)
+            return self.llm_service.generate_order_flow_response(
+                user_message=f"{text}\n\n[SİSTEM: Varyant seçimi tamamlandı. Aşağıdaki fiyat özetini müşteriye göster ve devam etmek isteyip istemediğini sor:]\n{price_summary}",
+                stage="price_summary",
+                order_data=order_data,
+                conversation_history=history
+            )
 
         order_data = self.order_service.get_order_data(platform, sender_id)
         session = self.order_service.get_session(platform, sender_id)
@@ -974,17 +1095,69 @@ class ChatBot:
         )
 
     async def _order_payment_selection(self, platform, sender_id, user_id, text, history, extracted) -> str:
-        """Ödeme yöntemi seçimi aşaması."""
-        payment = extracted.get("payment_method")
+        """Ödeme yöntemi seçimi aşaması (onay sonrası)."""
+        payment_raw = extracted.get("payment_method")
+        payment = payment_raw.lower().strip() if payment_raw else None
+        
         if payment and payment in ("kapida_odeme", "havale", "eft"):
             self.order_service.set_payment_method(platform, sender_id, payment)
-            self.order_service.update_stage(platform, sender_id, "customer_info")
 
+            # Sipariş verisini al (complete_order öncesi)
+            order_data = self.order_service.get_order_data(platform, sender_id)
+
+            # Siparişi tamamla
+            order_id = self.order_service.complete_order(platform, sender_id)
+            if order_id:
+                if payment == "kapida_odeme":
+                    response = (
+                        "Siparişiniz başlatılıyor. "
+                        "Siparişiniz oluşturulduğunda sipariş numarası tarafınıza iletilecektir. ✨"
+                    )
+                else:
+                    # Havale veya EFT — admin bildirim hook'unu tetikle
+                    self.order_service.on_payment_requires_admin(
+                        order_id=order_id,
+                        payment_method=payment,
+                        session_data=order_data
+                    )
+                    response = (
+                        "Ödeme işlemleri için yönetici bekleniyor. "
+                        "En kısa sürede işleminiz gerçekleştirilecektir. 🙏"
+                    )
+                return response
+            else:
+                return "Sipariş oluşturulurken bir hata oluştu. Lütfen tekrar deneyin."
+
+        # Ödeme yöntemi henüz seçilmedi — LLM'e sor
         order_data = self.order_service.get_order_data(platform, sender_id)
         session = self.order_service.get_session(platform, sender_id)
         return self.llm_service.generate_order_flow_response(
             user_message=text,
             stage=session.stage if session else "payment_selection",
+            order_data=order_data,
+            conversation_history=history
+        )
+
+    async def _order_price_summary(self, platform, sender_id, user_id, text, history, extracted) -> str:
+        """Fiyat özeti aşaması — müşteriye sepet toplamını gösterir."""
+        # Müşteri devam etmek istiyor mu?
+        if extracted.get("confirms_price") or extracted.get("confirms_order"):
+            self.order_service.update_stage(platform, sender_id, "customer_info")
+            order_data = self.order_service.get_order_data(platform, sender_id)
+            return self.llm_service.generate_order_flow_response(
+                user_message=f"{text}\n\n[SİSTEM: Müşteri fiyat özetini kabul etti. Şimdi teslimat bilgilerini topla: isim, telefon, e-posta, adres.]",
+                stage="customer_info",
+                order_data=order_data,
+                conversation_history=history
+            )
+
+        # Vazgeçmek istiyor olabilir — LLM'e ilet
+        order_data = self.order_service.get_order_data(platform, sender_id)
+        price_summary = self.order_service.build_price_summary(platform, sender_id)
+        session = self.order_service.get_session(platform, sender_id)
+        return self.llm_service.generate_order_flow_response(
+            user_message=f"{text}\n\n[Mevcut fiyat özeti:]\n{price_summary}",
+            stage=session.stage if session else "price_summary",
             order_data=order_data,
             conversation_history=history
         )
@@ -995,6 +1168,7 @@ class ChatBot:
         info_update = {}
         if extracted.get("name"): info_update["name"] = extracted["name"]
         if extracted.get("phone"): info_update["phone"] = extracted["phone"]
+        if extracted.get("email"): info_update["email"] = extracted["email"]
         if extracted.get("address"): info_update["address"] = extracted["address"]
 
         if info_update:
@@ -1004,7 +1178,7 @@ class ChatBot:
         session = self.order_service.get_session(platform, sender_id)
         info = session.customer_info if session else {}
 
-        if info.get("name") and info.get("phone") and info.get("address"):
+        if info.get("name") and info.get("phone") and info.get("email") and info.get("address"):
             # Tüm bilgiler tamam → confirmation aşamasına geç
             self.order_service.update_stage(platform, sender_id, "confirmation")
             # Sipariş özetini oluştur ve LLM'e ver
@@ -1031,15 +1205,13 @@ class ChatBot:
         # Değişiklik isteniyor mu?
         if extracted.get("wants_change"):
             change_field = extracted.get("change_field", "")
-            if change_field in ("address", "phone", "name"):
+            if change_field in ("address", "phone", "email", "name"):
                 self.order_service.update_stage(platform, sender_id, "customer_info")
             elif change_field in ("variant",):
                 self.order_service.update_stage(platform, sender_id, "variant_selection")
             elif change_field in ("product",):
                 self.order_service.clear_products(platform, sender_id)
                 self.order_service.update_stage(platform, sender_id, "product_selection")
-            elif change_field in ("payment",):
-                self.order_service.update_stage(platform, sender_id, "payment_selection")
             else:
                 self.order_service.update_stage(platform, sender_id, "customer_info")
 
@@ -1047,6 +1219,7 @@ class ChatBot:
             info_update = {}
             if extracted.get("name"): info_update["name"] = extracted["name"]
             if extracted.get("phone"): info_update["phone"] = extracted["phone"]
+            if extracted.get("email"): info_update["email"] = extracted["email"]
             if extracted.get("address"): info_update["address"] = extracted["address"]
             if info_update:
                 self.order_service.set_customer_info(platform, sender_id, info_update)
@@ -1065,35 +1238,16 @@ class ChatBot:
                 conversation_history=history
             )
 
-        # Onay geldi mi?
+        # Onay geldi mi? → Ödeme yöntemine geç
         if extracted.get("confirms_order"):
-            session = self.order_service.get_session(platform, sender_id)
-            payment = session.payment_method if session else "kapida_odeme"
-            order_id = self.order_service.complete_order(platform, sender_id)
-            if order_id:
-                if payment == "kapida_odeme":
-                    response = (
-                        f"Siparişiniz başarıyla oluşturuldu! 🎉\n\n"
-                        f"Sipariş No: #{order_id}\n"
-                        f"Ödeme Yöntemi: Kapıda Ödeme\n\n"
-                        f"Siparişiniz en kısa sürede hazırlanıp kargoya verilecektir. "
-                        f"Teşekkür ederiz! 💕\n\n"
-                        f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
-                    )
-                else:
-                    # Havale veya EFT
-                    method_label = "Havale" if payment == "havale" else "EFT"
-                    response = (
-                        f"Siparişiniz alınmıştır! 🎉\n\n"
-                        f"Sipariş No: #{order_id}\n"
-                        f"Ödeme Yöntemi: {method_label}\n\n"
-                        f"Ödeme bilgileri için yöneticimiz kısa süre içinde size dönecektir. "
-                        f"Teşekkür ederiz! 💕\n\n"
-                        f"Başka bir sorunuz olursa her zaman buradayım! 🌸"
-                    )
-                return response
-            else:
-                return "Sipariş oluşturulurken bir hata oluştu. Lütfen tekrar deneyin."
+            self.order_service.update_stage(platform, sender_id, "payment_selection")
+            order_data = self.order_service.get_order_data(platform, sender_id)
+            return self.llm_service.generate_order_flow_response(
+                user_message=f"{text}\n\n[SİSTEM: Müşteri siparişi onayladı. Şimdi ödeme yöntemini sor: 1) Kapıda Ödeme, 2) Havale, 3) EFT]",
+                stage="payment_selection",
+                order_data=order_data,
+                conversation_history=history
+            )
 
         # Ne onay ne değişiklik — LLM'e sor
         order_summary = self.order_service.build_order_summary(platform, sender_id)
