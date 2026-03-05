@@ -4,16 +4,18 @@ Kategoriler:
 1. "product_inquiry" — Müşteri bir ürün hakkında bilgi soruyor (fiyat, renk, beden, stok durumu vb.)
 2. "order_request" — Müşteri bir ürün sipariş etmek veya satın almak istiyor.
 3. "order_tracking" — Müşteri mevcut siparişinin durumunu, kargosunu veya takibini soruyor.
-4. "greeting" — Müşteri selamlama yapıyor (merhaba, selam, iyi günler vb.)
-5. "complaint" — Müşteri bir şikayet veya sorun bildiriyor.
-6. "general_chat" — Yukarıdaki kategorilere uymayan genel sohbet.
+4. "exchange_request" — Müşteri satın aldığı bir ürünü değiştirmek veya iade etmek istiyor.
+5. "greeting" — Müşteri selamlama yapıyor (merhaba, selam, iyi günler vb.)
+6. "complaint" — Müşteri bir şikayet veya sorun bildiriyor.
+7. "general_chat" — Yukarıdaki kategorilere uymayan genel sohbet.
 
 Kurallar:
 - Sadece kategori ismini döndür, başka hiçbir şey yazma.
 - Eğer mesaj birden fazla kategoriye uyuyorsa, en baskın olanı seç.
 - Ürün adı geçiyorsa veya ürünle ilgili bilgi isteniyorsa "product_inquiry" seç.
 - "Almak istiyorum", "Sipariş", "Satın al", "Nasıl alırım" gibi ifadeler varsa "order_request" seç.
-- "Siparişim nerede", "Kargom ne oldu", "Siparişimin durumu", "Takip numarası", "Sipariş takip", "Sipariş sorgula", "Siparişim ne zaman gelir", "Sipariş sorgulicam", "Buradan sorgulamak istiyorum", "Siparişe bak", "Sipariş durumunu öğrenmek istiyorum" gibi ifadeler varsa KESİNLİKLE "order_tracking" seç.
+- "Değişim", "Değiştirmek", "Farklı beden", "Farklı renk", "İade", "Geri göndermek" gibi ifadeler varsa "exchange_request" seç.
+- "Siparişim nerede", "Kargom ne oldu", "Siparişimin durumu", "Takip numarası", "Sipariş takip", "Sipariş sorgula", "Siparişim ne zaman gelir" veya SADECE İsim Soyisim/Sipariş No veriliyorsa (ve asistan az önce bunları istemişse) KESİNLİKLE "order_tracking" seç.
 
 Örnek:
 Mesaj: "Kırmızı elbise kaç TL?"
@@ -22,13 +24,13 @@ Cevap: product_inquiry
 Mesaj: "Bu ürünü almak istiyorum"
 Cevap: order_request
 
+Mesaj: "M beden ileşim yapmak istiyorum"
+Cevap: exchange_request
+
 Mesaj: "Siparişim nerede?"
 Cevap: order_tracking
 
 Mesaj: "Kargom ne zaman gelir?"
-Cevap: order_tracking
-
-Mesaj: "Siparişimin durumunu öğrenmek istiyorum"
 Cevap: order_tracking
 
 Mesaj: "Merhaba"

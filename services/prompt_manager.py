@@ -22,6 +22,7 @@ class PromptManager:
     GREETING_RESPONSE = "greeting_response_prompt.txt"
     ORDER_FLOW_PROMPT = "order_flow_prompt.txt"
     ORDER_TRACKING_PROMPT = "order_tracking_prompt.txt"
+    EXCHANGE_REQUEST_PROMPT = "exchange_request_prompt.txt"
 
     _cache: dict[str, str] = {}
 
@@ -88,6 +89,11 @@ class PromptManager:
     def get_order_tracking_prompt(cls) -> str:
         """Sipariş takip promptunu döndürür."""
         return cls.load_prompt(cls.ORDER_TRACKING_PROMPT)
+
+    @classmethod
+    def get_exchange_request_prompt(cls) -> str:
+        """Değişim talebi promptunu döndürür."""
+        return cls.load_prompt(cls.EXCHANGE_REQUEST_PROMPT)
 
     @classmethod
     def clear_cache(cls):

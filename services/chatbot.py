@@ -772,8 +772,8 @@ class ChatBot:
         self.conversation_service.save_message(
             user_id=user_id, platform=platform, role="user", content=user_message, message_id=message_id
         )
-
-        intent = self.llm_service.classify_intent(user_message)
+        # 1. Intent'i belirle (Geçmişe bakarak daha isabetli sonuç alır)
+        intent = self.llm_service.classify_intent(user_message, history)
 
         # Sipariş takip devam kontrolü:
         # Müşteri son mesajda sipariş sorguluyordu ve şimdi bilgi veriyorsa
@@ -826,6 +826,8 @@ class ChatBot:
             return self._handle_order_request(platform, sender_id, user_message, user_id, history)
         elif intent == "order_tracking":
             return await self._handle_order_tracking(platform, sender_id, user_message, user_id, history)
+        elif intent == "exchange_request":
+            return self.llm_service.generate_exchange_response(user_message, history)
         elif intent == "greeting":
             return self.llm_service.generate_greeting_response(
                 user_message, is_returning, history
@@ -904,7 +906,7 @@ class ChatBot:
         
         # 1. Kullanıcının mesajından sipariş bilgisi çıkar
         extracted = self.llm_service.extract_tracking_info(user_message, history)
-        phone = (extracted.get("phone") or "").strip()
+        fullname = (extracted.get("fullname") or "").strip()
         email = (extracted.get("email") or "").strip()
         order_number = (extracted.get("order_number") or "").strip()
 
@@ -917,15 +919,15 @@ class ChatBot:
                 orders = [order]
                 print(f"[OrderTracking] Sipariş numarasıyla bulundu: #{order_number}")
 
-        # 3. Telefon verilmişse ara
-        if not orders and phone:
-            orders = self.order_tracking_service.find_orders_by_phone(phone)
-            print(f"[OrderTracking] Telefon ile {len(orders)} sipariş bulundu: {phone}")
+        # 3. İsim/Soyisim verilmişse ara
+        if not orders and fullname:
+            orders = self.order_tracking_service.find_orders_by_name(fullname)
+            print(f"[OrderTracking] İsim ile {len(orders)} sipariş bulundu: {fullname}")
 
         # 4. E-posta ile arama devre dışı bırakıldı
 
         # 5. Hiçbir bilgi verilmediyse — bu chat'te oluşturulmuş sipariş var mı bak
-        if not orders and not phone and not order_number:
+        if not orders and not fullname and not order_number:
             local_orders = self.order_tracking_service.find_orders_by_user_id(user_id)
             if local_orders:
                 orders = local_orders
@@ -941,13 +943,13 @@ class ChatBot:
             )
 
         # 7. Hiçbir sonuç bulunamadı
-        if phone or email or order_number:
+        if fullname or email or order_number:
             # Bilgi verildi ama sonuç yok — diğer yöntemleri öner
             no_result_data = (
                 f"[SİSTEM: Müşteri aşağıdaki bilgilerle sipariş sorguladı ama hiçbir sonuç bulunamadı.\n"
-                f"Telefon: {phone or 'verilmedi'}\n"
+                f"İsim Soyisim: {fullname or 'verilmedi'}\n"
                 f"Sipariş No: {order_number or 'verilmedi'}\n\n"
-                f"Müşteriye başka/farklı bir numara veya sipariş numarası ile tekrar denemesini teklif et. "
+                f"Müşteriye başka/farklı bir isim veya sipariş numarası ile tekrar denemesini teklif et. "
                 f"Eğer kontrol edebileceği bir link istersen {TRACKING_URL} adresini ver, ancak bunu vermek yerine sohbette çözmeye odaklan.]"
             )
             return self.llm_service.generate_order_tracking_response(
@@ -960,8 +962,8 @@ class ChatBot:
         ask_info_data = (
             f"[SİSTEM: Müşteri siparişinin durumunu öğrenmek istiyor ama henüz KİMLİK BİLGİSİ VERMEDİ. \n"
             f"Bu sohbette oluşturulmuş bir sipariş de bulunamadı.\n"
-            f"Müşteriden siparişini sorgulayabilmek için KESİNLİKLE VE SADECE telefon numarasını veya sipariş numarasını İSTE. \n"
-            f"Sakin ona sipariş izleme sitesinin linkini verme. Müşteri buradaki sohbet üzerinden sorgulama yapmalıdır.]"
+            f"Müşteriden siparişini sorgulayabilmek için KESİNLİKLE İsim Soyisim veya Sipariş Numarasını İSTE. \n"
+            f"Sakın ona sipariş izleme sitesinin linkini verme. Müşteri buradaki sohbet üzerinden sorgulama yapmalıdır.]"
         )
         return self.llm_service.generate_order_tracking_response(
             user_message=user_message,

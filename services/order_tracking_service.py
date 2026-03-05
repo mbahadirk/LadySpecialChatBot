@@ -198,48 +198,69 @@ class OrderTrackingService:
 
     # ─── CSV'den Sipariş Arama ───
 
-    def find_orders_by_phone(self, phone: str) -> list[dict]:
-        """Telefon numarasına göre sipariş arar (Webhook -> CSV)."""
-        phone = self._normalize_phone(phone)
-        if not phone:
+    def find_orders_by_name(self, fullname: str) -> list[dict]:
+        """İsim/Soyisim'e göre sipariş arar (Webhook -> DB -> CSV)."""
+        search_query = self._normalize_text(fullname)
+        if not search_query or len(search_query) < 2:
             return []
 
         results = []
         found_nums = set()
 
-        # İlk önce webhook cache'e bak
+        # 1. İlk önce webhook cache'e bak
         for order_num, order in self._webhook_cache.items():
-            order_phone = self._normalize_phone(order.get("phone", ""))
-            # Eğer girilen numara en az 7 haneliyse ve sistemdeki numara bu girilen kısımla bitiyorsa eşleştir (Başı eksik yazılmış olabilir)
-            if len(phone) >= 7 and order_phone.endswith(phone):
-                results.append(order)
-                found_nums.add(order_num)
-            elif phone == order_phone:
+            order_name = self._normalize_text(order.get("customer_name", ""))
+            if self._is_name_match(search_query, order_name):
                 results.append(order)
                 found_nums.add(order_num)
 
+        # 2. Yerel DB'de ara
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            rows = cursor.execute("SELECT id, customer_name FROM orders").fetchall()
+            for row in rows:
+                db_name = self._normalize_text(row["customer_name"] or "")
+                order_id = str(row["id"])
+                if order_id not in found_nums and self._is_name_match(search_query, db_name):
+                    # Tam sipariş verisini çek
+                    order = self.find_order_by_number(order_id)
+                    if order:
+                        results.append(order)
+                        found_nums.add(order_id)
+            conn.close()
+        except Exception as e:
+            print(f"[OrderTracking] Local DB isim arama hatası: {e}")
+
+        # 3. CSV'de ara
         orders = self._load_csv_orders()
         for order in orders:
-            # Eğer numara cache'te zaten bulunduysa, eski CSV versiyonunu ekleme
-            if order.get("order_number") in found_nums:
+            order_num = order.get("order_number")
+            if order_num in found_nums:
                 continue
 
-            order_phone = self._normalize_phone(order.get("phone", ""))
-            billing_phone = self._normalize_phone(order.get("billing_phone", ""))
-            
-            # Kısmi eşleşme (endswith) kontrolü: En az 7 haneli girilmişse numaraların sonu eşleşiyor mu diye bak
-            is_match = False
-            if len(phone) >= 7:
-                is_match = order_phone.endswith(phone) or billing_phone.endswith(phone)
-            else:
-                is_match = phone in (order_phone, billing_phone)
-                
-            if is_match:
+            order_name = self._normalize_text(order.get("customer_name", ""))
+            if self._is_name_match(search_query, order_name):
                 results.append({**order, "source": "ikas"})
+                found_nums.add(order_num)
 
         # En güncel siparişler önce gelsin
         results.sort(key=lambda x: x.get("order_date", ""), reverse=True)
         return results
+
+    def _is_name_match(self, query: str, target: str) -> bool:
+        """İsim eşleşme mantığı."""
+        if not query or not target:
+            return False
+        # Tam içeriyor mu?
+        if query in target or target in query:
+            return True
+        # Parçalı eşleşme (örn: "Merve Çelik" -> "Merve")
+        query_parts = [p for p in query.split() if len(p) > 2]
+        for part in query_parts:
+            if part in target:
+                return True
+        return False
 
     def find_orders_by_email(self, email: str) -> list[dict]:
         """E-posta adresine göre sipariş arar (Kullanım dışı bırakıldı)."""
@@ -317,9 +338,7 @@ class OrderTrackingService:
                 price = f" — {item['price']} TL" if item.get("price") else ""
                 lines.append(f"  • {item['product_name']}{variant}{price}")
 
-        total = order.get("grand_total", "")
-        if total:
-            lines.append(f"\n💰 Toplam: {total} TL")
+        # Toplam tutar satırı kaldırıldı (müşteri isteği)
 
         payment = order.get("payment_method", "")
         if payment:
@@ -368,6 +387,26 @@ class OrderTrackingService:
         if len(digits) >= 10:
             return digits[-10:]
         return digits
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Türkçe karakterleri normalize eder, fazla boşlukları siler ve temizler."""
+        if not text:
+            return ""
+        # 1. Fazla boşlukları temizle (İçerdeki çift boşlukları tek boşluğa indir)
+        text = " ".join(text.split())
+        
+        # 2. Küçük harfe çevir
+        text = text.lower().strip()
+        
+        # 3. Türkçe karakter dönüşümü
+        chars = {
+            'ı': 'i', 'ç': 'c', 'ş': 's', 'ğ': 'g', 'ü': 'u', 'ö': 'o',
+            'İ': 'i', 'Ç': 'c', 'Ş': 's', 'Ğ': 'g', 'Ü': 'u', 'Ö': 'o'
+        }
+        for tr, eng in chars.items():
+            text = text.replace(tr, eng)
+        return text
 
     @staticmethod
     def _map_local_status(status: str) -> str:

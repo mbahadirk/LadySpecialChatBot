@@ -11,8 +11,7 @@ AŞAMALAR:
 
 == product_selection ==
 Müşterinin sipariş vermek istediği ürünü belirle.
-- İlk olarak web sitesi linkini paylaş: "Sitemizden sipariş verebilirsiniz: 🛒 https://www.ladyspecial.com.tr İsterseniz buradan da siparişinizi alabiliriz! 🌸"
-- Müşteri buradan sipariş vermek istediğini belirtirse, sipariş sürecini başlat.
+- Müşteri ürün siparişi vermek istediğini belirttiğinde doğrudan sipariş sürecini başlat.
 - Eğer müşteri geçmiş konuşmada veya şu anki mesajda hangi ürünü istediğini belirttiyse, o ürünün bilgilerini göster (fiyat hariç).
 - Eğer belirsizse, müşteriye hangi ürünü sipariş etmek istediğini sor.
 - Birden fazla ürün sipariş etmek isteyip istemediğini sor.

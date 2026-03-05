@@ -28,31 +28,38 @@ class LLMService:
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = model
 
-    def classify_intent(self, user_message: str) -> str:
+    def classify_intent(self, user_message: str, conversation_history: list[dict] = None) -> str:
         """
-        Müşterinin mesajının intent'ini (niyetini) belirler.
+        Müşterinin mesajının intent'ini (niyetini) geçmiş konuşmayı da baz alarak belirler.
 
         Returns:
-            "product_inquiry" | "order_request" | "order_tracking" | "greeting" | "complaint" | "general_chat"
+            "product_inquiry" | "order_request" | "order_tracking" | "exchange_request" | "greeting" | "complaint" | "general_chat"
         """
         classification_prompt = PromptManager.get_intent_classification_prompt()
 
+        history_text = ""
+        if conversation_history:
+            recent = conversation_history[-5:]
+            for msg in recent:
+                role = "Müşteri" if msg.get("role") == "user" else "Asistan"
+                history_text += f"{role}: {msg.get('content', '')}\n"
+
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Intent sınıflandırma için mini yeterli
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": classification_prompt},
-                    {"role": "user", "content": sanitize_prompt_input(user_message)}
+                    {"role": "user", "content": f"Geçmiş Konuşma:\n{history_text}\n\nYeni Mesaj: {sanitize_prompt_input(user_message)}"}
                 ],
                 max_tokens=20,
-                temperature=0.0  # Deterministik çıktı
+                temperature=0.0
             )
             intent = response.choices[0].message.content.strip().lower()
 
             # Bilinen intent'lerden biri mi kontrol et
             valid_intents = [
                 "product_inquiry", "order_request", "order_tracking",
-                "greeting", "complaint", "general_chat"
+                "greeting", "complaint", "exchange_request", "general_chat"
             ]
             if intent not in valid_intents:
                 print(f"⚠️ Bilinmeyen intent: '{intent}' → general_chat olarak ayarlandı")
@@ -518,21 +525,25 @@ class LLMService:
                 role = "Müşteri" if msg.get("role") == "user" else "Asistan"
                 history_text += f"{role}: {msg.get('content', '')}\n"
 
-        prompt = f"""Kullanıcının mesajından sipariş takip için gerekli bilgileri çıkar.
+        prompt = f"""Geçmiş konuşmayı ve müşterinin son mesajını analiz ederek sipariş takip için gerekli bilgileri çıkar.
+ÖNEMLİ: Müşteri ismini konuşmanın başında (selamlaşırken vs.) söylemişse, o ismi 'fullname' olarak mutlaka çıkar.
 
 Çıkarılacak alanlar:
-- phone: Telefon numarası (varsa)
-- email: E-posta adresi (varsa)
+- fullname: İsim Soyisim (geçmişte veya son mesajda varsa)
 - order_number: Sipariş numarası (varsa, sadece bir sayı)
-- wants_tracking: Müşteri siparişini sorgulamak istiyor mu? (true/false)
+- wants_tracking: Müşteri siparişi ile ilgili bilgi almak istiyor mu? (true/false)
+
+KURALLAR:
+1. Telefon numarası veya e-posta ASLA çıkarma.
+2. Eğer müşteri "siparişim nerede" diyorsa ve ismini biliyorsan, 'wants_tracking' true olmalı.
 
 Geçmiş konuşma:
 {history_text}
 
-Müşteri mesajı: {user_message}
+Müşterinin son mesajı: {user_message}
 
 SADECE JSON döndür, başka hiçbir şey yazma:
-{{"phone": "", "email": "", "order_number": "", "wants_tracking": true}}"""
+{{"fullname": "", "order_number": "", "wants_tracking": true}}"""
 
         messages = [
             {"role": "system", "content": "Sipariş bilgisi çıkaran asistan. SADECE JSON döndür."},
@@ -550,7 +561,7 @@ SADECE JSON döndür, başka hiçbir şey yazma:
                 cleaned = cleaned.rsplit("```", 1)[0]
             return json.loads(cleaned)
         except Exception:
-            return {"phone": "", "email": "", "order_number": "", "wants_tracking": True}
+            return {"fullname": "", "email": "", "order_number": "", "wants_tracking": True}
 
     def generate_order_tracking_response(
         self, user_message: str, order_data: str,
@@ -571,6 +582,32 @@ SADECE JSON döndür, başka hiçbir şey yazma:
 
         messages = [
             {"role": "system", "content": system_content},
+            *history_messages,
+            {"role": "user", "content": sanitize_prompt_input(user_message)}
+        ]
+
+        return self._call_llm(messages)
+
+    # ══════════════════════════════════════════
+    #  DEĞİŞİM TALEBİ
+    # ══════════════════════════════════════════
+
+    def generate_exchange_response(
+        self, user_message: str, conversation_history: list[dict] = None
+    ) -> str:
+        """Değişim/iade talepleri için doğal dilde cevap üretir."""
+        exchange_prompt = PromptManager.get_exchange_request_prompt()
+
+        history_messages = []
+        if conversation_history:
+            for msg in conversation_history[-6:]:
+                role = msg.get("role", "user")
+                if role not in ("user", "assistant"):
+                    role = "user"
+                history_messages.append({"role": role, "content": msg.get("content", "")})
+
+        messages = [
+            {"role": "system", "content": exchange_prompt},
             *history_messages,
             {"role": "user", "content": sanitize_prompt_input(user_message)}
         ]
