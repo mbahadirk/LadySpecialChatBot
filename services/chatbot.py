@@ -946,11 +946,9 @@ class ChatBot:
         if fullname or email or order_number:
             # Bilgi verildi ama sonuç yok — diğer yöntemleri öner
             no_result_data = (
-                f"[SİSTEM: Müşteri aşağıdaki bilgilerle sipariş sorguladı ama hiçbir sonuç bulunamadı.\n"
-                f"İsim Soyisim: {fullname or 'verilmedi'}\n"
-                f"Sipariş No: {order_number or 'verilmedi'}\n\n"
-                f"Müşteriye başka/farklı bir isim veya sipariş numarası ile tekrar denemesini teklif et. "
-                f"Eğer kontrol edebileceği bir link istersen {TRACKING_URL} adresini ver, ancak bunu vermek yerine sohbette çözmeye odaklan.]"
+                f"[SİSTEM: Müşteri aşağıdaki bilgilerle ({fullname or order_number}) sipariş sorguladı ama hiçbir sonuç bulunamadı.\n"
+                f"Müşteriye tam olarak şu cevabı ver veya bu anlamı taşıyan çok benzer bir cümle kur:\n"
+                f"'İsminizi ve soyisminizi doğru yazdığınıza emin misiniz? Sistemde kayıtlı bir siparişinizi bulamadım. Dilerseniz sipariş numarasıyla devam edebiliriz.']"
             )
             return self.llm_service.generate_order_tracking_response(
                 user_message=user_message,
