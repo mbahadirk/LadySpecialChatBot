@@ -13,10 +13,11 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Security
 from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from utils.security_utils import verify_meta_signature, get_api_key
 
 # Windows encoding fix
 from utils.logger import setup_encoding
@@ -108,6 +109,19 @@ if not os.path.exists("static"):
     os.makedirs("static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ─── Global Exception Handler ───
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Tüm yakalanamayan hataları yakalar ve kullanıcıya güvenli mesaj döner."""
+    print(f"🔥 UNHANDLED ERROR: {exc}")
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Bir iç sunucu hatası oluştu. Lütfen daha sonra tekrar deneyin."},
+    )
+from fastapi.responses import JSONResponse
+
 
 # ═══════════════════════════════════════════
 #  SAYFA ENDPOINT'LERİ
@@ -156,6 +170,14 @@ async def verify_webhook(request: Request):
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """WhatsApp ve Instagram'dan gelen mesajları işler."""
+    # Güvenlik kontrolü: Meta imza doğrulaması
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    body = await request.body()
+    
+    if not verify_meta_signature(body, signature):
+        print(f"❌ Webhook imza doğrulama hatası! Signature: {signature}")
+        raise HTTPException(status_code=403, detail="Geçersiz imza")
+
     try:
         data = await request.json()
         obj_type = data.get("object")
@@ -248,20 +270,16 @@ async def receive_webhook(request: Request):
 @app.post("/ikas/webhook/order")
 async def receive_ikas_order_webhook(request: Request):
     """Ikas sipariş durum güncellemelerini alır."""
-    # Güvenlik kontrolü (Ikas webhook header'ından client_id gelip gelmediği varsayımı)
+    # Güvenlik kontrolü
+    client_id_header = request.headers.get("x-ikas-client-id", "")
+    ikas_client_id = os.getenv("IKAS_ORDERING_CLIENT_ID", "")
+    
+    if ikas_client_id and client_id_header != ikas_client_id:
+        print(f"❌ Ikas Webhook: Yetkisiz erişim denemesi. Client ID: {client_id_header}")
+        raise HTTPException(status_code=403, detail="Yetkisiz erişim")
+
     try:
         data = await request.json()
-        print(f"\n{'='*60}")
-        print("IKAS WEBHOOK GELDI")
-        print(f"{'='*60}")
-        client_id_header = request.headers.get("x-ikas-client-id", "")
-        # İki tür client id tanımlı, sipariş için olanı kontrol edelim
-        ikas_client_id = os.getenv("IKAS_ORDERING_CLIENT_ID", "")
-        if ikas_client_id and client_id_header != ikas_client_id:
-            # Şimdilik güvenlik uyarısi verip devam etsin, header yapısını bilmiyoruz
-            print(f"[UYARI] Ikas Webhook: Header eşleşmedi. Gelen: {client_id_header}, Beklenen: {ikas_client_id}")
-
-        print(json.dumps(data, indent=2, ensure_ascii=False))
 
         # Order tracking service'i güncelle
         if hasattr(chatbot, 'order_tracker') and chatbot.order_tracker:
@@ -294,8 +312,8 @@ async def health_check():
     }
 
 
-@app.post("/test/chat")
-@app.post("/api/chat")
+@app.post("/test/chat", dependencies=[Security(get_api_key)])
+@app.post("/api/chat", dependencies=[Security(get_api_key)])
 async def test_chat(request: Request):
     """Test endpoint'i: Botu denemek için."""
     try:
@@ -329,7 +347,7 @@ async def test_chat(request: Request):
         return {"error": str(e)}
 
 
-@app.post("/api/upload")
+@app.post("/api/upload", dependencies=[Security(get_api_key)])
 async def api_upload(file: UploadFile = File(...)):
     """Web arayüzünden görsel yükleme."""
     try:
@@ -346,7 +364,7 @@ async def api_upload(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 
-@app.post("/api/sync")
+@app.post("/api/sync", dependencies=[Security(get_api_key)])
 async def manual_sync():
     """Manuel senkronizasyon tetikleme."""
     try:

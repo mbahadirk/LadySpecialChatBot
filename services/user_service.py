@@ -17,16 +17,28 @@ class UserService:
         Platformdan gelen ID ile kullanıcıyı bulur veya yenisini oluşturur.
 
         Args:
-            platform: 'whatsapp' veya 'instagram'
+            platform: 'whatsapp', 'instagram' veya 'web'
             platform_id: Platformdaki kullanıcı ID'si
 
         Returns:
             Kullanıcı bilgilerini içeren dict (id, whatsapp_id, instagram_id, ...)
         """
+        # Güvenlik: Platformu doğrula ve SQL enjeksiyonunu önle
+        allowed_platforms = {
+            "whatsapp": "whatsapp_id",
+            "instagram": "instagram_id",
+            "web": "whatsapp_id"  # Web için geçici olarak whatsapp_id kullanılıyor olabilir veya ayrı bir sütun gerekebilir
+        }
+        
+        if platform not in allowed_platforms:
+            print(f"⚠️ Bilinmeyen platform: {platform}")
+            # Fallback veya hata fırlatma (şimdilik mevcut mantığı koruyalım ama güvenli şekilde)
+            column = "whatsapp_id" 
+        else:
+            column = allowed_platforms[platform]
+
         conn = get_connection()
         cursor = conn.cursor()
-
-        column = f"{platform}_id"
 
         # Önce mevcut kullanıcıyı ara
         cursor.execute(f"SELECT * FROM users WHERE {column} = ?", (platform_id,))
@@ -65,8 +77,17 @@ class UserService:
         Mevcut kullanıcıya ikinci bir platform ID'si bağlar.
         Örneğin WhatsApp ile kayıtlı kullanıcıya Instagram ID ekler.
         """
+        allowed_platforms = {
+            "whatsapp": "whatsapp_id",
+            "instagram": "instagram_id"
+        }
+        
+        if platform not in allowed_platforms:
+            print(f"⚠️ Linkleme için geçersiz platform: {platform}")
+            return
+
+        column = allowed_platforms[platform]
         conn = get_connection()
-        column = f"{platform}_id"
         conn.execute(
             f"UPDATE users SET {column} = ?, updated_at = ? WHERE id = ?",
             (platform_id, datetime.utcnow().isoformat(), user_id)

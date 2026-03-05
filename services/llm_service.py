@@ -10,6 +10,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from services.prompt_manager import PromptManager
+from utils.security_utils import sanitize_prompt_input
 
 load_dotenv()
 
@@ -41,7 +42,7 @@ class LLMService:
                 model="gpt-4o-mini",  # Intent sınıflandırma için mini yeterli
                 messages=[
                     {"role": "system", "content": classification_prompt},
-                    {"role": "user", "content": user_message}
+                    {"role": "user", "content": sanitize_prompt_input(user_message)}
                 ],
                 max_tokens=20,
                 temperature=0.0  # Deterministik çıktı
@@ -97,7 +98,7 @@ class LLMService:
         # Kullanıcının mesajını ve ürün bilgilerini ekle
         messages.append({
             "role": "user",
-            "content": f"Müşteri mesajı: {user_message}\n\nBulunan ürün bilgileri:\n{product_info_text}"
+            "content": f"Müşteri mesajı: {sanitize_prompt_input(user_message)}\n\nBulunan ürün bilgileri:\n{product_info_text}"
         })
 
         return self._call_llm(messages)
@@ -122,7 +123,7 @@ class LLMService:
         messages.extend(conversation_history)
         messages.append({
             "role": "user",
-            "content": f"Müşteri mesajı: {user_message}\n\nİlgili ürün bilgileri:\n{product_info_text}"
+            "content": f"Müşteri mesajı: {sanitize_prompt_input(user_message)}\n\nİlgili ürün bilgileri:\n{product_info_text}"
         })
 
         return self._call_llm(messages)
@@ -148,7 +149,7 @@ class LLMService:
             {"role": "system", "content": f"{system_prompt}\n\n{greeting_prompt}\n\nNot: {context_note}"}
         ]
         messages.extend(conversation_history[-4:])  # Son birkaç mesaj yeterli
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": sanitize_prompt_input(user_message)})
 
         return self._call_llm(messages, model="gpt-4o-mini")
 
@@ -166,7 +167,7 @@ class LLMService:
             {"role": "system", "content": system_prompt}
         ]
         messages.extend(conversation_history)
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": sanitize_prompt_input(user_message)})
 
         return self._call_llm(messages)
 
@@ -192,7 +193,7 @@ class LLMService:
             ]
             if conversation_history:
                 messages.extend(conversation_history[-4:])
-            messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "user", "content": sanitize_prompt_input(user_message)})
 
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -265,7 +266,7 @@ class LLMService:
             {"role": "system", "content": f"{system_prompt}\n\n{order_flow_prompt}{order_context}"}
         ]
         messages.extend(conversation_history)
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": sanitize_prompt_input(user_message)})
 
         return self._call_llm(messages)
 
@@ -307,7 +308,7 @@ class LLMService:
             messages = [{"role": "system", "content": extract_prompt}]
             if conversation_history:
                 messages.extend(conversation_history[-6:])
-            messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "user", "content": sanitize_prompt_input(user_message)})
 
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -352,7 +353,7 @@ class LLMService:
         messages.append({
             "role": "user",
             "content": (
-                f"Musteri bir urun gorseli gonderdi ve su mesaji yazdi: \"{user_message}\"\n\n"
+                f"Musteri bir urun gorseli gonderdi ve su mesaji yazdi: \"{sanitize_prompt_input(user_message)}\"\n\n"
                 f"{results_text}"
             )
         })
@@ -379,7 +380,7 @@ class LLMService:
         messages.append({
             "role": "user",
             "content": (
-                f"Müşteri şu mesajı attı: \"{user_message}\"\n\n"
+                f"Müşteri şu mesajı attı: \"{sanitize_prompt_input(user_message)}\"\n\n"
                 f"Postun açıklamasından tespit edilen ürünler:\n{results_text}"
             )
         })
@@ -571,7 +572,7 @@ SADECE JSON döndür, başka hiçbir şey yazma:
         messages = [
             {"role": "system", "content": system_content},
             *history_messages,
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": sanitize_prompt_input(user_message)}
         ]
 
         return self._call_llm(messages)
